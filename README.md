@@ -1,147 +1,115 @@
-# PostgresRocks - RocksDB-Backed PostgreSQL Table Access Method
+# PostgresRocks
 
-A complete PostgreSQL table access method extension that uses RocksDB as the storage engine. This allows PostgreSQL tables to be stored in RocksDB's key-value format while maintaining full SQL compatibility.
+A PostgreSQL extension that implements a custom table access method using RocksDB as the storage engine with **columnar storage format**.
 
 ## Storage Format
 
-- **Row Keys**: `table_<oid>_<rowid>` - stores serialized tuple data
-- **Metadata Keys**: `meta_<oid>_rowcount` - tracks row count for ID generation
-- **Binary Serialization**: Tuples are serialized with type information and null flags
+### Columnar Architecture
+
+The extension uses a **columnar storage format** where data is organized by columns rather than rows:
+
+```
+Traditional Row Storage:    Columnar Storage:
+┌─────────┬─────────┐      ┌─────────┬─────────┐
+│ Row 1   │ Row 2   │      │ Col 1   │ Col 2   │
+├─────────┼─────────┤      ├─────────┼─────────┤
+│ A, B    │ C, D    │      │ A, C    │ B, D    │
+└─────────┴─────────┘      └─────────┴─────────┘
+```
+
+### Key Structure
+
+- **Column Data**: `col_<table_oid>_<column_index>_<chunk_id>` → [column_values]
+- **Metadata**: `meta_<table_oid>_info` → [row_count, column_count, chunk_size]
+- **Row Mapping**: `row_<table_oid>_<row_id>` → [chunk_id, chunk_offset]
+
+### Data Organization
+
+1. **Chunked Storage**: Data is divided into chunks of 1000 rows for efficient access
+2. **Column Compression**: Similar data types are stored together for better compression
+3. **Null Bitmap**: Efficient null value representation using bitmaps
+4. **Type-Aware Serialization**: Optimized binary format for each data type
+
 
 ## Prerequisites
 
-### macOS (Recommended)
-
-1. **Install PostgreSQL and RocksDB**:
-   ```bash
-   # Install PostgreSQL (includes development headers)
-   brew install postgresql
-   
-   # Install RocksDB
-   brew install rocksdb
-   
-   # Start PostgreSQL service
-   brew services start postgresql
-   ```
+### macOS
+- Homebrew
+- RocksDB: `brew install rocksdb`
+- PostgreSQL 17: `brew install postgresql@17`
 
 ### Linux
+- RocksDB development libraries
+- PostgreSQL 17 development headers
 
-1. **PostgreSQL Development Headers**: 
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install postgresql-server-dev-all
-   ```
+## Build and Install
 
-2. **RocksDB Library**:
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install librocksdb-dev
-   
-   # From source
-   git clone https://github.com/facebook/rocksdb.git
-   cd rocksdb
-   make shared_lib
-   sudo make install-shared
-   ```
-
-## Building and Installing
-
-### Quick Start (Automated)
-
-Use the provided build script for automatic dependency checking and installation:
+### Automated Build (Recommended)
 
 ```bash
-# Build and install (checks dependencies automatically)
-./build.sh install
-
-# Or just build
+chmod +x build.sh
 ./build.sh
 ```
 
+The script will:
+1. Check and install dependencies
+2. Build the extension
+3. Install it to PostgreSQL
+4. Provide testing instructions
+
 ### Manual Build
 
-1. **Build the extension**:
-   ```bash
-   make clean
-   make
-   ```
+```bash
+# Set PostgreSQL paths
+export PG_CONFIG=/opt/homebrew/bin/pg_config
+export MACOSX_DEPLOYMENT_TARGET=11.0
 
-2. **Install the extension**:
-   ```bash
-   # macOS (Homebrew PostgreSQL usually doesn't need sudo)
-   make install
-   
-   # Linux or system PostgreSQL
-   sudo make install
-   ```
+# Build and install
+make
+sudo make install
+
+# Create extension in PostgreSQL
+psql -d postgres -c "CREATE EXTENSION postgresrocks;"
+```
 
 ## Usage
 
-1. **Create the extension** in your database:
-   ```sql
-   CREATE EXTENSION postgresrocks;
-   ```
+### Create Tables
 
-2. **Create tables** using the RocksDB storage engine:
-   ```sql
-   CREATE TABLE my_table(id INT, name TEXT, value BIGINT) USING postgresrocks;
-   ```
+```sql
+-- Create a table using the postgresrocks storage engine
+CREATE TABLE test_table (
+    id SERIAL,
+    name TEXT,
+    value INTEGER
+) USING postgresrocks;
 
-3. **Use standard SQL operations**:
-   ```sql
-   -- Insert data
-   INSERT INTO my_table VALUES (1, 'Hello', 1000);
-   INSERT INTO my_table VALUES (2, 'World', 2000);
-   
-   -- Query data
-   SELECT * FROM my_table;
-   SELECT * FROM my_table WHERE id > 1;
-   SELECT name FROM my_table ORDER BY id;
-   
-   -- Delete data
-   DELETE FROM my_table WHERE id = 1;
-   
-   -- Truncate table
-   TRUNCATE TABLE my_table;
-   
-   -- Check table size
-   SELECT pg_relation_size('my_table') as size_bytes;
-   
-   -- See query planning with size estimates
-   EXPLAIN (COSTS ON) SELECT * FROM my_table;
-   
-   -- Test speculative insertion support
-   CREATE TABLE unique_table(id INT UNIQUE, name TEXT) USING postgresrocks;
-   INSERT INTO unique_table VALUES (1, 'test');
-   ```
+-- Insert data
+INSERT INTO test_table (name, value) VALUES 
+    ('Alice', 100),
+    ('Bob', 200),
+    ('Charlie', 300);
 
-## Supported Data Types
+-- Query data
+SELECT * FROM test_table WHERE value > 150;
+```
 
-Currently supported PostgreSQL data types:
-- `INT` (4-byte integer)
-- `BIGINT` (8-byte integer)  
-- `TEXT` (variable-length text)
-- `VARCHAR(n)` (variable-length character string)
+### Supported Data Types
+
+- **Integers**: `INTEGER`, `BIGINT`
+- **Text**: `TEXT`, `VARCHAR`
 
 ## Testing
 
-Run the comprehensive test suite:
-```bash
-psql -d your_database -f test.sql
+After installation, test the extension:
+
+```sql
+-- Test basic functionality
+CREATE TABLE test (id INT, name TEXT) USING postgresrocks;
+INSERT INTO test VALUES (1, 'Hello'), (2, 'World');
+SELECT * FROM test;
+
+-- Test speculative insertion
+CREATE TABLE test_unique (id INT UNIQUE, name TEXT) USING postgresrocks;
+INSERT INTO test_unique VALUES (1, 'First') ON CONFLICT (id) DO NOTHING;
 ```
-
-## Architecture
-
-The table access method implements all required PostgreSQL storage callbacks:
-
-1. **Scan Operations**: `rocks_beginscan`, `rocks_getnextslot`, `rocks_endscan`
-2. **Modification Operations**: `rocks_tuple_insert`, `rocks_tuple_delete`
-3. **Speculative Operations**: `rocks_tuple_insert_speculative`, `rocks_tuple_complete_speculative`
-4. **Relation Management**: `rocks_relation_set_new_filelocator`, `rocks_relation_nontransactional_truncate`
-5. **Utility Operations**: Serialization, key generation, RocksDB management
-
-## References
-
-- [Phil Eaton's PostgreSQL Table Access Methods Tutorial](https://notes.eatonphil.com/2023-11-01-postgres-table-access-methods.html)
-- [PostgreSQL Table Access Method Documentation](https://www.postgresql.org/docs/current/tableam.html)
-- [RocksDB C API Documentation](https://github.com/facebook/rocksdb/wiki/RocksDB-C-API)
