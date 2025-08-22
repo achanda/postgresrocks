@@ -1,0 +1,61 @@
+# PostgreSQL Extension Build Artifacts
+*.o
+*.so
+*.dylib
+*.bc
+
+# Backup files
+*~
+*.bak
+*.orig
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*#
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# RocksDB data directory (if created during testing)
+postgresrocks_data/
+
+# Log files
+*.log
+
+# Test databases
+test_data/
+
+# Temporary files
+tmp/
+temp/
+
+# Core dumps
+core.*
+
+# Make dependency files
+.deps/
+
+# Autotools generated files (if used)
+config.log
+config.status
+autom4te.cache/
+
+# Package files
+*.tar.gz
+*.zip
+
+# Coverage files
+*.gcov
+*.gcno
+*.gcda
+
+# Valgrind output
+valgrind-*.log
+
+# PostgreSQL specific
+postgresql.conf.local
+pg_hba.conf.local
