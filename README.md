@@ -9,12 +9,12 @@ A PostgreSQL extension that implements a custom table access method using RocksD
 The extension uses a **columnar storage format** where data is organized by columns rather than rows:
 
 ```
-Traditional Row Storage:    Columnar Storage:
-┌─────────┬─────────┐      ┌─────────┬─────────┐
-│ Row 1   │ Row 2   │      │ Col 1   │ Col 2   │
-├─────────┼─────────┤      ├─────────┼─────────┤
-│ A, B    │ C, D    │      │ A, C    │ B, D    │
-└─────────┴─────────┘      └─────────┴─────────┘
+Columnar Storage:
+┌─────────┬─────────┐
+│ Col 1   │ Col 2   │
+├─────────┼─────────┤
+│ A, C    │ B, D    │
+└─────────┴─────────┘
 ```
 
 ### Key Structure

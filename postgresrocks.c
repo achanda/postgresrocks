@@ -29,6 +29,7 @@
 #include "storage/itemptr.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/attnum.h"
 #include "storage/bufpage.h"
 
 #include <rocksdb/c.h>
@@ -74,7 +75,6 @@ typedef struct SpeculativeInsertEntry
 
 /* Columnar storage constants */
 #define CHUNK_SIZE 1000  /* Number of rows per chunk */
-#define MAX_COLUMNS 32   /* Maximum columns per table */
 
 /* Column data structure */
 typedef struct ColumnChunk
@@ -91,7 +91,7 @@ typedef struct TableMetadata
     uint64 row_count;
     uint32 column_count;
     uint32 chunk_size;
-    Oid column_types[MAX_COLUMNS];
+    Oid column_types[MaxAttrNumber];
 } TableMetadata;
 
 /* Row mapping structure */
@@ -151,7 +151,7 @@ typedef struct RocksScanDesc
     TableMetadata table_meta;
     uint32 current_chunk_id;
     uint32 current_chunk_offset;
-    ColumnChunk *current_chunks[MAX_COLUMNS];
+    ColumnChunk *current_chunks[MaxAttrNumber];
     bool chunks_loaded;
     
     /* Scan state for table access method */
@@ -963,7 +963,7 @@ load_column_chunks(RocksScanDesc *scan, Relation relation)
     natts = tupdesc->natts;
     
     /* Clear any existing chunks */
-    for (i = 0; i < MAX_COLUMNS; i++) {
+    for (i = 0; i < MaxAttrNumber; i++) {
         if (scan->current_chunks[i]) {
             pfree(scan->current_chunks[i]->data);
             pfree(scan->current_chunks[i]);
@@ -1446,7 +1446,7 @@ rocks_relation_set_new_filelocator(Relation rel,
     meta->column_count = natts;
     
     /* Store column types */
-    for (i = 0; i < natts && i < MAX_COLUMNS; i++) {
+    for (i = 0; i < natts && i < MaxAttrNumber; i++) {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
         meta->column_types[i] = attr->atttypid;
     }
