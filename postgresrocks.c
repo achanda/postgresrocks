@@ -301,17 +301,16 @@ get_next_row_info(Oid table_oid, uint64 *rowid, uint32 *chunk_id, uint32 *chunk_
     
     *rowid = meta->row_count + 1;
     
-    /* Implement proper chunking with CHUNK_SIZE rows per chunk */
-    *chunk_id = (*rowid - 1) / meta->chunk_size;  /* Proper chunk assignment */
-    *chunk_offset = (*rowid - 1) % meta->chunk_size;  /* Offset within chunk */
+    /* For now, use one row per chunk to avoid complexity - each row gets its own chunk_id */
+    *chunk_id = *rowid - 1;  /* Each row gets its own chunk ID for simplicity */
+    *chunk_offset = 0;       /* Always offset 0 since we have one row per chunk */
     
     /* Update row count */
     meta->row_count = *rowid;
     
-    /* Only update metadata every 100 inserts for better performance */
-    if (meta->row_count % 100 == 0) {
-        update_table_metadata(table_oid, meta);
-    }
+    /* Update metadata after each row for correctness */
+    update_table_metadata(table_oid, meta);
+    elog(LOG, "Updated metadata: table_oid=%u, row_count=%lu", table_oid, meta->row_count);
     
     pfree(meta);
 }
@@ -650,8 +649,49 @@ rocks_finish_bulk_insert_stub(Relation relation, int options)
     TableMetadata *meta = get_table_metadata(table_oid, false);
     
     if (meta) {
+        /* Find the actual row count by scanning for the highest row ID */
+        char *prefix;
+        size_t prefix_len;
+        rocksdb_iterator_t *iter;
+        uint64 max_rowid = 0;
+        
+        prefix = make_table_prefix(table_oid, &prefix_len);
+        iter = rocksdb_create_iterator(rocks_db, rocks_read_options);
+        rocksdb_iter_seek(iter, prefix, prefix_len);
+        
+        /* Scan through all row mappings to find the highest row ID */
+        while (rocksdb_iter_valid(iter)) {
+            const char *key;
+            size_t key_len;
+            
+            key = rocksdb_iter_key(iter, &key_len);
+            
+            /* Check if this key belongs to our table */
+            if (key_len < prefix_len || 
+                memcmp(key, prefix, prefix_len) != 0) {
+                break;
+            }
+            
+            /* Parse the row ID from the key: "row_<table_oid>_<rowid>" */
+            uint64 rowid = 0;
+            if (sscanf(key + prefix_len, "%lu", &rowid) == 1) {
+                if (rowid > max_rowid) {
+                    max_rowid = rowid;
+                }
+            }
+            
+            rocksdb_iter_next(iter);
+        }
+        
+        rocksdb_iter_destroy(iter);
+        pfree(prefix);
+        
+        /* Update metadata with the actual row count */
+        meta->row_count = max_rowid;
         update_table_metadata(table_oid, meta);
         pfree(meta);
+        
+        elog(LOG, "rocks_finish_bulk_insert: Updated metadata with row_count=%lu", max_rowid);
     }
 }
 
@@ -735,7 +775,7 @@ static const TableAmRoutine rocks_methods = {
     .tuple_delete = NULL,
     .tuple_update = NULL,
     .tuple_lock = NULL,
-    .finish_bulk_insert = NULL,
+    .finish_bulk_insert = rocks_finish_bulk_insert_stub,
 
     /* DDL related functionality */
     .relation_set_new_filelocator = rocks_relation_set_new_filelocator,
@@ -988,19 +1028,40 @@ rocks_beginscan(Relation relation, Snapshot snapshot,
                ParallelTableScanDesc parallel_scan,
                uint32 flags)
 {
-    TableScanDescData *scan;
+    RocksScanDesc *scan;
+    Oid table_oid;
+    TableMetadata *meta;
     
-    elog(LOG, "rocks_beginscan called - creating minimal scan");
+    elog(LOG, "rocks_beginscan called - creating scan with iterator");
     
-    /* Use standard PostgreSQL scan structure */
-    scan = (TableScanDescData *) palloc0(sizeof(TableScanDescData));
-    scan->rs_rd = relation;
-    scan->rs_snapshot = snapshot;
-    scan->rs_nkeys = nkeys;
-    scan->rs_key = key;
-    scan->rs_flags = flags;
+    init_rocksdb();
     
-    elog(LOG, "rocks_beginscan completed - returning scan descriptor");
+    /* Use our custom scan structure */
+    scan = (RocksScanDesc *) palloc0(sizeof(RocksScanDesc));
+    scan->rs_base.rs_rd = relation;
+    scan->rs_base.rs_snapshot = snapshot;
+    scan->rs_base.rs_nkeys = nkeys;
+    scan->rs_base.rs_key = key;
+    scan->rs_base.rs_flags = flags;
+    
+    /* Initialize scan state */
+    table_oid = RelationGetRelid(relation);
+    scan->key_prefix = make_table_prefix(table_oid, &scan->key_prefix_len);
+    scan->current_rowid = 1;  /* Start from first row */
+    scan->started = false;
+    
+    /* Get table metadata to know how many rows we have */
+    meta = get_table_metadata(table_oid, false);
+    if (meta) {
+        scan->total_rows = meta->row_count;
+        elog(LOG, "rocks_beginscan - found metadata: table_oid=%u, row_count=%lu", table_oid, meta->row_count);
+        pfree(meta);
+    } else {
+        scan->total_rows = 0;
+        elog(LOG, "rocks_beginscan - NO metadata found for table_oid=%u", table_oid);
+    }
+    
+    elog(LOG, "rocks_beginscan completed - scan ready, total_rows=%lu", scan->total_rows);
     
     return (TableScanDesc) scan;
 }
@@ -1077,19 +1138,143 @@ static bool
 rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
                  TupleTableSlot *slot)
 {
-    elog(LOG, "rocks_getnextslot called - returning false immediately");
+    RocksScanDesc *scan = (RocksScanDesc *) sscan;
+    Relation relation = scan->rs_base.rs_rd;
+    Oid table_oid = RelationGetRelid(relation);
+    TupleDesc tupdesc = RelationGetDescr(relation);
+    int natts = tupdesc->natts;
+    char *row_key;
+    size_t row_key_len;
+    char *row_data, *err;
+    size_t row_data_len;
+    RowMapping *row_map;
+    int col_idx;
     
-    /* For debugging - return no rows to avoid any slot manipulation issues */
-    return false;
+    elog(LOG, "rocks_getnextslot called - current_rowid=%lu, total_rows=%lu", 
+         scan->current_rowid, scan->total_rows);
+    
+    /* Check if we've scanned all rows */
+    if (scan->current_rowid > scan->total_rows) {
+        elog(LOG, "rocks_getnextslot - no more rows, returning false");
+        return false;
+    }
+    
+    /* Get row mapping for current row */
+    row_key = make_row_mapping_key(table_oid, scan->current_rowid, &row_key_len);
+    err = NULL;
+    row_data = rocksdb_get(rocks_db, rocks_read_options, row_key, row_key_len, &row_data_len, &err);
+    
+    if (err != NULL) {
+        elog(ERROR, "RocksDB get error for row mapping: %s", err);
+        free(err);
+    }
+    
+    if (row_data == NULL) {
+        elog(LOG, "rocks_getnextslot - row %lu not found, skipping", scan->current_rowid);
+        scan->current_rowid++;
+        pfree(row_key);
+        return rocks_getnextslot(sscan, direction, slot);  /* Try next row */
+    }
+    
+    row_map = (RowMapping *) row_data;
+    elog(LOG, "rocks_getnextslot - found row %lu in chunk %u, offset %u", 
+         scan->current_rowid, row_map->chunk_id, row_map->chunk_offset);
+    
+    /* Clear the slot */
+    ExecClearTuple(slot);
+    
+    /* Fetch column data for each attribute */
+    for (col_idx = 0; col_idx < natts; col_idx++) {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, col_idx);
+        Oid type_oid = attr->atttypid;
+        char *col_key;
+        size_t col_key_len;
+        char *col_data;
+        size_t col_data_len;
+        Datum value;
+        bool isnull;
+        
+        /* Get column data */
+        col_key = make_column_key(table_oid, col_idx, row_map->chunk_id, &col_key_len);
+        err = NULL;
+        col_data = rocksdb_get(rocks_db, rocks_read_options, col_key, col_key_len, &col_data_len, &err);
+        
+        if (err != NULL) {
+            elog(ERROR, "RocksDB get error for column data: %s", err);
+            free(err);
+        }
+        
+        if (col_data == NULL || col_data_len == 0) {
+            /* Column not found - treat as NULL */
+            slot->tts_values[col_idx] = (Datum) 0;
+            slot->tts_isnull[col_idx] = true;
+        } else {
+            /* Deserialize column data */
+            if (col_data[0] == 1) {
+                /* NULL flag */
+                slot->tts_values[col_idx] = (Datum) 0;
+                slot->tts_isnull[col_idx] = true;
+            } else {
+                /* Non-null data */
+                isnull = false;
+                switch (type_oid) {
+                    case INT4OID: {
+                        int32 val;
+                        memcpy(&val, col_data + 1, sizeof(int32));
+                        value = Int32GetDatum(val);
+                        break;
+                    }
+                    case TEXTOID:
+                    case VARCHAROID: {
+                        int32 len;
+                        memcpy(&len, col_data + 1, sizeof(int32));
+                        text *txt = (text *) palloc(VARHDRSZ + len);
+                        SET_VARSIZE(txt, VARHDRSZ + len);
+                        memcpy(VARDATA(txt), col_data + 1 + sizeof(int32), len);
+                        value = PointerGetDatum(txt);
+                        break;
+                    }
+                    default:
+                        elog(ERROR, "rocks_getnextslot: unsupported type %u", type_oid);
+                        value = (Datum) 0;
+                        isnull = true;
+                }
+                slot->tts_values[col_idx] = value;
+                slot->tts_isnull[col_idx] = isnull;
+            }
+        }
+        
+        pfree(col_key);
+        if (col_data) free(col_data);
+    }
+    
+    /* Set slot as valid */
+    slot->tts_nvalid = natts;
+    ExecStoreVirtualTuple(slot);
+    
+    /* Move to next row */
+    scan->current_rowid++;
+    
+    /* Cleanup */
+    pfree(row_key);
+    free(row_data);
+    
+    elog(LOG, "rocks_getnextslot - returning row with %d columns", natts);
+    return true;
 }
 
 static void
 rocks_endscan(TableScanDesc sscan)
 {
+    RocksScanDesc *scan = (RocksScanDesc *) sscan;
+    
     elog(LOG, "rocks_endscan called");
-    if (sscan) {
-        /* Simple cleanup - just free the scan descriptor */
-        pfree(sscan);
+    if (scan) {
+        /* Cleanup scan state */
+        if (scan->key_prefix) {
+            pfree(scan->key_prefix);
+        }
+        pfree(scan);
     }
 }
 
@@ -1102,6 +1287,8 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     Oid table_oid = RelationGetRelid(relation);
     uint64 rowid;
     uint32 chunk_id, chunk_offset;
+    
+    elog(LOG, "rocks_tuple_insert - table_oid=%u", table_oid);
     char *err = NULL;
     TupleDesc tupdesc = slot->tts_tupleDescriptor;
     int natts = tupdesc->natts;
