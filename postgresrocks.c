@@ -694,7 +694,7 @@ static const TableAmRoutine rocks_methods = {
     .type = T_TableAmRoutine,
 
     /* Slot related callbacks */
-    .slot_callbacks = NULL,
+    .slot_callbacks = rocks_slot_callbacks,
 
     /* Table scan callbacks */
     .scan_begin = rocks_beginscan,
@@ -1117,6 +1117,9 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     
     init_rocksdb();
     
+    /* Ensure the slot is properly materialized */
+    slot_getallattrs(slot);
+    
     /* Get next row ID and chunk information */
     get_next_row_info(table_oid, &rowid, &chunk_id, &chunk_offset);
     
@@ -1135,15 +1138,23 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     
     /* Store column values in chunks */
     for (col_idx = 0; col_idx < natts; col_idx++) {
+        elog(LOG, "Starting to process column %d", col_idx);
         attr = TupleDescAttr(tupdesc, col_idx);
+        elog(LOG, "Got TupleDescAttr for column %d", col_idx);
         type_oid = attr->atttypid;
+        elog(LOG, "Got type_oid %u for column %d", type_oid, col_idx);
         
         /* Create column chunk key */
+        elog(LOG, "About to create column key for col %d, table_oid=%u, chunk_id=%u", col_idx, table_oid, chunk_id);
         col_key = make_column_key(table_oid, col_idx, chunk_id, &col_key_len);
+        elog(LOG, "Created column key for col %d, key_len=%zu", col_idx, col_key_len);
         
         /* For now, store single values (will be optimized later) */
+        elog(LOG, "About to access slot values for column %d", col_idx);
         values[0] = slot->tts_values[col_idx];
+        elog(LOG, "Got slot value for column %d", col_idx);
         isnulls[0] = slot->tts_isnull[col_idx];
+        elog(LOG, "Got slot isnull for column %d", col_idx);
         
         data = serialize_column_chunk(values, isnulls, type_oid, 1, &data_len);
         
@@ -1154,16 +1165,20 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
              data_len > 0 ? (int)data[0] : -1);
         
         /* Store in RocksDB */
+        elog(LOG, "About to call rocksdb_put for column %d", col_idx);
         rocksdb_put(rocks_db, rocks_write_options, col_key, col_key_len,
                     data, data_len, &err);
+        elog(LOG, "rocksdb_put completed for column %d", col_idx);
         
         if (err != NULL) {
             elog(ERROR, "RocksDB put error for column data: %s", err);
             free(err);
         }
         
+        elog(LOG, "About to pfree for column %d", col_idx);
         pfree(col_key);
         pfree(data);
+        elog(LOG, "Completed processing column %d", col_idx);
     }
     
     pfree(row_key);
