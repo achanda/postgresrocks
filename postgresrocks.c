@@ -610,6 +610,9 @@ static void rocks_index_validate_scan(Relation tablerel, Relation indexrel,
                                      ValidateIndexState *state);
 static uint64 rocks_relation_size(Relation rel, ForkNumber forkNumber);
 static bool rocks_relation_needs_toast_table(Relation rel);
+static void rocks_relation_estimate_size(Relation rel, int32 *attr_widths,
+                                        BlockNumber *pages, double *tuples,
+                                        double *allvisfrac);
 
 
 /* Minimal stub implementations for required functions */
@@ -754,7 +757,7 @@ static const TableAmRoutine rocks_methods = {
     .relation_fetch_toast_slice = NULL,
 
     /* Planner related functions - MISSING FIELDS! */
-    .relation_estimate_size = NULL,
+    .relation_estimate_size = rocks_relation_estimate_size,
 
     /* Executor related functions - MISSING FIELDS! */
     .scan_bitmap_next_block = NULL,
@@ -1718,6 +1721,19 @@ rocks_relation_needs_toast_table(Relation rel)
 {
     /* For simplicity, assume no TOAST table is needed */
     return false;
+}
+
+static void
+rocks_relation_estimate_size(Relation rel, int32 *attr_widths,
+                            BlockNumber *pages, double *tuples,
+                            double *allvisfrac)
+{
+    elog(LOG, "rocks_relation_estimate_size called");
+    
+    /* Provide basic estimates for query planning */
+    *pages = 1000;           /* Estimate 1000 pages */
+    *tuples = 10000.0;       /* Estimate 10000 tuples */
+    *allvisfrac = 1.0;       /* All pages are visible */
 }
 
 
