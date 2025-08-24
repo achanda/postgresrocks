@@ -47,6 +47,9 @@ static rocksdb_writeoptions_t* rocks_write_options = NULL;
 /* Hash table for tracking speculative insertions */
 static HTAB* speculative_insertions = NULL;
 
+/* Simple global scan counter for debugging */
+static int global_scan_counter = 0;
+
 /* Structure to track speculative insertions */
 typedef struct SpeculativeInsertEntry
 {
@@ -60,6 +63,8 @@ typedef struct SpeculativeInsertEntry
     char *data;             /* Serialized tuple data */
     size_t data_len;        /* Data length */
 } SpeculativeInsertEntry;
+
+/* Remove scan state structure - using simple global counter for now */
 
 /* Storage format design - COLUMNAR STORAGE:
  * Key format: 
@@ -179,6 +184,8 @@ init_speculative_hash(void)
                                         HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
+/* Remove scan hash initialization */
+
 /* Function to initialize RocksDB */
 static void
 init_rocksdb(void)
@@ -294,14 +301,17 @@ get_next_row_info(Oid table_oid, uint64 *rowid, uint32 *chunk_id, uint32 *chunk_
     
     *rowid = meta->row_count + 1;
     
-    /* For now, assign each row its own chunk for simplicity */
-    /* This avoids rows overwriting each other until we implement proper chunking */
-    *chunk_id = *rowid - 1;  /* Each row gets its own chunk ID */
-    *chunk_offset = 0;       /* Always offset 0 since we have one row per chunk */
+    /* Implement proper chunking with CHUNK_SIZE rows per chunk */
+    *chunk_id = (*rowid - 1) / meta->chunk_size;  /* Proper chunk assignment */
+    *chunk_offset = (*rowid - 1) % meta->chunk_size;  /* Offset within chunk */
     
     /* Update row count */
     meta->row_count = *rowid;
-    update_table_metadata(table_oid, meta);
+    
+    /* Only update metadata every 100 inserts for better performance */
+    if (meta->row_count % 100 == 0) {
+        update_table_metadata(table_oid, meta);
+    }
     
     pfree(meta);
 }
@@ -632,7 +642,14 @@ rocks_relation_vacuum_stub(Relation onerel, VacuumParams *params,
 static void
 rocks_finish_bulk_insert_stub(Relation relation, int options)
 {
-    /* Stub implementation */
+    /* Ensure metadata is updated at the end of bulk operations */
+    Oid table_oid = RelationGetRelid(relation);
+    TableMetadata *meta = get_table_metadata(table_oid, false);
+    
+    if (meta) {
+        update_table_metadata(table_oid, meta);
+        pfree(meta);
+    }
 }
 
 static TM_Result
@@ -672,39 +689,78 @@ rocks_multi_insert_stub(Relation relation, TupleTableSlot **slots,
     /* Stub implementation */
 }
 
-/* Table access method routine structure */
+/* Table access method routine structure - complete PostgreSQL 17 compatible version */
 static const TableAmRoutine rocks_methods = {
     .type = T_TableAmRoutine,
 
-    .slot_callbacks = rocks_slot_callbacks,
+    /* Slot related callbacks */
+    .slot_callbacks = NULL,
 
+    /* Table scan callbacks */
     .scan_begin = rocks_beginscan,
     .scan_end = rocks_endscan,
     .scan_rescan = rocks_rescan,
     .scan_getnextslot = rocks_getnextslot,
 
+    /* TID range scan callbacks - MISSING FIELDS! */
+    .scan_set_tidrange = NULL,
+    .scan_getnextslot_tidrange = NULL,
+
+    /* Parallel table scan callbacks - MISSING FIELDS! */
+    .parallelscan_estimate = NULL,
+    .parallelscan_initialize = NULL,
+    .parallelscan_reinitialize = NULL,
+
+    /* Index scan callbacks - MISSING FIELDS! */
+    .index_fetch_begin = NULL,
+    .index_fetch_reset = NULL,
+    .index_fetch_end = NULL,
+    .index_fetch_tuple = NULL,
+
+    /* Non-modifying operations on individual tuples - MISSING FIELDS! */
+    .tuple_fetch_row_version = NULL,
+    .tuple_tid_valid = NULL,
+    .tuple_get_latest_tid = NULL,
+    .tuple_satisfies_snapshot = NULL,
+    .index_delete_tuples = NULL,
+
+    /* Manipulations of physical tuples */
     .tuple_insert = rocks_tuple_insert,
-    .tuple_insert_speculative = rocks_tuple_insert_speculative,
-    .tuple_complete_speculative = rocks_tuple_complete_speculative,
-    .multi_insert = rocks_multi_insert_stub,
-    .tuple_delete = rocks_tuple_delete_stub,
-    .tuple_update = rocks_tuple_update_stub,
-    .tuple_lock = rocks_tuple_lock_stub,
+    .tuple_insert_speculative = NULL,
+    .tuple_complete_speculative = NULL,
+    .multi_insert = NULL,
+    .tuple_delete = NULL,
+    .tuple_update = NULL,
+    .tuple_lock = NULL,
+    .finish_bulk_insert = NULL,
 
-    .finish_bulk_insert = rocks_finish_bulk_insert_stub,
-
+    /* DDL related functionality */
     .relation_set_new_filelocator = rocks_relation_set_new_filelocator,
-    .relation_nontransactional_truncate = rocks_relation_nontransactional_truncate,
-    .relation_copy_data = rocks_relation_copy_data_stub,
-    .relation_copy_for_cluster = rocks_relation_copy_for_cluster_stub,
-    .relation_vacuum = rocks_relation_vacuum_stub,
+    .relation_nontransactional_truncate = NULL,
+    .relation_copy_data = NULL,
+    .relation_copy_for_cluster = NULL,
+    .relation_vacuum = NULL,
     .scan_analyze_next_block = NULL,
     .scan_analyze_next_tuple = NULL,
     .index_build_range_scan = NULL,
     .index_validate_scan = NULL,
 
+    /* Miscellaneous functions */
     .relation_size = rocks_relation_size,
     .relation_needs_toast_table = rocks_relation_needs_toast_table,
+
+    /* MISSING FIELDS! */
+    .relation_toast_am = NULL,
+    .relation_fetch_toast_slice = NULL,
+
+    /* Planner related functions - MISSING FIELDS! */
+    .relation_estimate_size = NULL,
+
+    /* Executor related functions - MISSING FIELDS! */
+    .scan_bitmap_next_block = NULL,
+    .scan_bitmap_next_tuple = NULL,
+    .scan_sample_next_block = NULL,
+    .scan_sample_next_tuple = NULL,
 };
 
 /* Entry point function */
@@ -712,6 +768,7 @@ PG_FUNCTION_INFO_V1(postgresrocks_tableam_handler);
 Datum
 postgresrocks_tableam_handler(PG_FUNCTION_ARGS)
 {
+    elog(LOG, "postgresrocks_tableam_handler called - returning TableAmRoutine");
     PG_RETURN_POINTER(&rocks_methods);
 }
 
@@ -907,11 +964,18 @@ postgresrocks_read_data(PG_FUNCTION_ARGS)
     }
 }
 
-/* Slot callbacks - use virtual tuple table slots */
+/* Slot callbacks - use heap tuple table slots for compatibility */
 static const TupleTableSlotOps *
 rocks_slot_callbacks(Relation relation)
 {
-    return &TTSOpsVirtual;
+    elog(LOG, "rocks_slot_callbacks called - START");
+    if (relation) {
+        elog(LOG, "rocks_slot_callbacks for relation %s", RelationGetRelationName(relation));
+    } else {
+        elog(LOG, "rocks_slot_callbacks called with NULL relation");
+    }
+    elog(LOG, "rocks_slot_callbacks returning TTSOpsHeapTuple");
+    return &TTSOpsHeapTuple;
 }
 
 /* Scan operations */
@@ -923,13 +987,17 @@ rocks_beginscan(Relation relation, Snapshot snapshot,
 {
     TableScanDescData *scan;
     
-    /* Use the basic TableScanDescData instead of our custom structure */
+    elog(LOG, "rocks_beginscan called - creating minimal scan");
+    
+    /* Use standard PostgreSQL scan structure */
     scan = (TableScanDescData *) palloc0(sizeof(TableScanDescData));
     scan->rs_rd = relation;
     scan->rs_snapshot = snapshot;
     scan->rs_nkeys = nkeys;
     scan->rs_key = key;
     scan->rs_flags = flags;
+    
+    elog(LOG, "rocks_beginscan completed - returning scan descriptor");
     
     return (TableScanDesc) scan;
 }
@@ -938,6 +1006,7 @@ static void
 rocks_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
             bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
+    elog(LOG, "rocks_rescan called");
     /* For basic scan, we don't need to do anything special */
 }
 
@@ -999,41 +1068,24 @@ load_column_chunks(RocksScanDesc *scan, Relation relation)
     scan->chunks_loaded = true;
 }
 
-/* Global counter for scan state */
-static int scan_counter = 0;
+/* RocksScanDesc already defined above with the fields we need */
 
 static bool
 rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
                  TupleTableSlot *slot)
 {
-    /* Return only one row per scan */
-    if (scan_counter >= 1) {
-        return false;
-    }
-    scan_counter++;
+    elog(LOG, "rocks_getnextslot called - returning false immediately");
     
-    /* Clear the slot first */
-    ExecClearTuple(slot);
-    
-    /* Set values directly - return the data we know exists */
-    slot->tts_values[0] = Int32GetDatum(100);
-    slot->tts_isnull[0] = false;
-    
-    /* Only set second column if it exists */
-    if (slot->tts_tupleDescriptor->natts > 1) {
-        slot->tts_values[1] = PointerGetDatum(cstring_to_text("Test TAM"));
-        slot->tts_isnull[1] = false;
-    }
-    
-    /* Store the tuple */
-    ExecStoreVirtualTuple(slot);
-    return true;
+    /* For debugging - return no rows to avoid any slot manipulation issues */
+    return false;
 }
 
 static void
 rocks_endscan(TableScanDesc sscan)
 {
+    elog(LOG, "rocks_endscan called");
     if (sscan) {
+        /* Simple cleanup - just free the scan descriptor */
         pfree(sscan);
     }
 }
@@ -1545,6 +1597,7 @@ static bool
 rocks_scan_analyze_next_block(TableScanDesc scan,
                              ReadStream *stream)
 {
+    elog(LOG, "rocks_scan_analyze_next_block called");
     /* TODO: Implement analysis block scanning */
     return false;
 }
@@ -1555,6 +1608,7 @@ rocks_scan_analyze_next_tuple(TableScanDesc scan,
                              double *liverows, double *deadrows,
                              TupleTableSlot *slot)
 {
+    elog(LOG, "rocks_scan_analyze_next_tuple called");
     /* TODO: Implement analysis tuple scanning */
     return false;
 }
@@ -1570,6 +1624,7 @@ rocks_index_build_range_scan(Relation tablerel, Relation indexrel,
                             void *callback_state,
                             TableScanDesc scan)
 {
+    elog(LOG, "rocks_index_build_range_scan called");
     /* TODO: Implement index building */
     return 0.0;
 }
@@ -1579,6 +1634,7 @@ rocks_index_validate_scan(Relation tablerel, Relation indexrel,
                          IndexInfo *indexInfo, Snapshot snapshot,
                          ValidateIndexState *state)
 {
+    elog(LOG, "rocks_index_validate_scan called");
     /* TODO: Implement index validation */
 }
 
