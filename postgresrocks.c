@@ -47,8 +47,6 @@ static rocksdb_writeoptions_t* rocks_write_options = NULL;
 /* Hash table for tracking speculative insertions */
 static HTAB* speculative_insertions = NULL;
 
-/* Global scan counter removed - was unused */
-
 /* Structure to track speculative insertions */
 typedef struct SpeculativeInsertEntry
 {
@@ -63,7 +61,6 @@ typedef struct SpeculativeInsertEntry
     size_t data_len;        /* Data length */
 } SpeculativeInsertEntry;
 
-/* Remove scan state structure - using simple global counter for now */
 
 /* Storage format design - ROW-BASED STORAGE:
  * Key format: 
@@ -325,8 +322,7 @@ init_speculative_hash(void)
                                         HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
-/* Remove scan hash initialization */
-
+    
 /* Function to initialize RocksDB */
 static void
 init_rocksdb(void)
@@ -425,37 +421,185 @@ update_table_metadata(Oid table_oid, TableMetadata *meta)
     pfree(key);
 }
 
-/* Get next row ID for insertion */
+/* Global row counter for batch operations */
+static HTAB* row_counters = NULL;
+
+/* Global write batch for accumulating single inserts */
+static rocksdb_writebatch_t* global_batch = NULL;
+static int batch_size = 0;
+#define MAX_BATCH_SIZE 1000
+
+typedef struct RowCounterEntry
+{
+    Oid table_oid;     /* Hash key */
+    uint64 next_rowid; /* Next row ID to assign */
+    bool dirty;        /* Whether metadata needs updating */
+} RowCounterEntry;
+
+/* Initialize row counter hash table */
+static void
+init_row_counter_hash(void)
+{
+    HASHCTL info;
+    
+    if (row_counters != NULL)
+        return; /* Already initialized */
+    
+    MemSet(&info, 0, sizeof(info));
+    info.keysize = sizeof(Oid);
+    info.entrysize = sizeof(RowCounterEntry);
+    info.hcxt = TopMemoryContext;
+    
+    row_counters = hash_create("Row Counters",
+                              256, /* initial size */
+                              &info,
+                              HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/* Get next row ID for insertion (optimized for bulk operations) */
 static uint64
 get_next_row_id(Oid table_oid)
 {
-    TableMetadata *meta = get_table_metadata(table_oid, true);
+    RowCounterEntry *entry;
+    bool found;
+    TableMetadata *meta;
     uint64 rowid;
     
-    if (!meta) {
-        elog(ERROR, "Failed to get table metadata for table %u", table_oid);
+    init_row_counter_hash();
+    
+    /* Look up cached counter */
+    entry = (RowCounterEntry *) hash_search(row_counters,
+                                           &table_oid,
+                                           HASH_ENTER,
+                                           &found);
+    
+    if (!found) {
+        /* Initialize from metadata */
+        meta = get_table_metadata(table_oid, true);
+        if (!meta) {
+            elog(ERROR, "Failed to get table metadata for table %u", table_oid);
+        }
+        
+        entry->table_oid = table_oid;
+        entry->next_rowid = meta->row_count + 1;
+        entry->dirty = false;
+        elog(LOG, "Initialized row counter: table_oid=%u, next_rowid=%lu, row_count=%lu", 
+             table_oid, entry->next_rowid, meta->row_count);
+        pfree(meta);
+    } else {
+        elog(LOG, "Found existing row counter: table_oid=%u, next_rowid=%lu, dirty=%s", 
+             table_oid, entry->next_rowid, entry->dirty ? "true" : "false");
     }
     
-    rowid = meta->row_count + 1;
+    rowid = entry->next_rowid++;
+    entry->dirty = true;
     
-    /* Update row count */
-    meta->row_count = rowid;
-    
-    /* Update metadata after each row for correctness */
-    update_table_metadata(table_oid, meta);
-    elog(LOG, "Updated metadata: table_oid=%u, row_count=%lu", table_oid, meta->row_count);
-    
-    pfree(meta);
+    elog(LOG, "Assigned row ID %lu for table %u (next will be %lu)", rowid, table_oid, entry->next_rowid);
     return rowid;
 }
 
-/* Old column-based functions removed - using row-based storage now */
+/* Flush pending write batch */
+static void
+flush_write_batch(void)
+{
+    char *err = NULL;
+    
+    if (global_batch == NULL || batch_size == 0) {
+        elog(LOG, "flush_write_batch called but no batch to flush");
+        return;
+    }
+    
+    elog(LOG, "About to flush write batch with %d operations", batch_size);
+    
+    /* Execute the accumulated batch */
+    rocksdb_write(rocks_db, rocks_write_options, global_batch, &err);
+    
+    if (err != NULL) {
+        elog(ERROR, "RocksDB batch write error: %s", err);
+        free(err);
+        return;
+    }
+    
+    elog(LOG, "Successfully flushed write batch with %d accumulated operations", batch_size);
+    
+    /* Reset batch */
+    rocksdb_writebatch_clear(global_batch);
+    batch_size = 0;
+}
 
-/* Old column chunk functions removed */
+static void flush_row_counter_metadata(Oid table_oid);
 
-/* Old column chunk deserialize functions removed */
+/* Force flush of any pending writes - called from scan operations */
+static void
+ensure_writes_flushed(void)
+{
+    if (global_batch != NULL && batch_size > 0) {
+        elog(LOG, "Forcing flush of pending writes before scan operation");
+        flush_write_batch();
+    }
+    
+    /* Also ensure any dirty row counters are flushed to metadata */
+    if (row_counters != NULL) {
+        HASH_SEQ_STATUS status;
+        RowCounterEntry *entry;
+        
+        hash_seq_init(&status, row_counters);
+        while ((entry = hash_seq_search(&status)) != NULL) {
+            if (entry->dirty) {
+                elog(LOG, "Flushing dirty row counter for table_oid=%u before scan", entry->table_oid);
+                flush_row_counter_metadata(entry->table_oid);
+            }
+        }
+    }
+}
 
-/* deserialize_stored_tuple function removed - was unused in row-based storage */
+/* Flush row counter metadata to storage */
+static void
+flush_row_counter_metadata(Oid table_oid)
+{
+    RowCounterEntry *entry;
+    bool found;
+    TableMetadata *meta;
+    
+    elog(LOG, "flush_row_counter_metadata called for table_oid=%u", table_oid);
+    
+    /* First flush any pending writes */
+    flush_write_batch();
+    
+    if (row_counters == NULL) {
+        elog(LOG, "Row counters hash table is NULL");
+        return;
+    }
+    
+    entry = (RowCounterEntry *) hash_search(row_counters,
+                                           &table_oid,
+                                           HASH_FIND,
+                                           &found);
+    
+    if (!found) {
+        elog(LOG, "No row counter entry found for table_oid=%u", table_oid);
+        return;
+    }
+    
+    if (!entry->dirty) {
+        elog(LOG, "Row counter for table_oid=%u is not dirty (next_rowid=%lu)", table_oid, entry->next_rowid);
+        return;
+    }
+    
+    elog(LOG, "Found dirty row counter: table_oid=%u, next_rowid=%lu, will set row_count=%lu", 
+         table_oid, entry->next_rowid, entry->next_rowid - 1);
+    
+    meta = get_table_metadata(table_oid, true);
+    if (meta) {
+        meta->row_count = entry->next_rowid - 1; /* -1 because next_rowid is the next to assign */
+        update_table_metadata(table_oid, meta);
+        pfree(meta);
+        entry->dirty = false;
+        elog(LOG, "Successfully flushed metadata: table_oid=%u, row_count=%lu", table_oid, meta->row_count);
+    } else {
+        elog(ERROR, "Failed to get table metadata for flushing");
+    }
+}
 
 /* Forward declarations */
 static const TupleTableSlotOps *rocks_slot_callbacks(Relation relation);
@@ -536,11 +680,6 @@ static void rocks_relation_estimate_size(Relation rel, int32 *attr_widths,
                                         double *allvisfrac);
 
 
-/* Stub implementations removed - using actual implementations now */
-
-/* All stub functions removed - using actual implementations */
-
-/* Table access method routine structure - complete PostgreSQL 17 compatible version */
 static const TableAmRoutine rocks_methods = {
     .type = T_TableAmRoutine,
 
@@ -553,22 +692,22 @@ static const TableAmRoutine rocks_methods = {
     .scan_rescan = rocks_rescan,
     .scan_getnextslot = rocks_getnextslot,
 
-    /* TID range scan callbacks - MISSING FIELDS! */
+    /* TID range scan callbacks */
     .scan_set_tidrange = NULL,
     .scan_getnextslot_tidrange = NULL,
 
-    /* Parallel table scan callbacks - MISSING FIELDS! */
+    /* Parallel table scan callbacks */
     .parallelscan_estimate = NULL,
     .parallelscan_initialize = NULL,
     .parallelscan_reinitialize = NULL,
 
-    /* Index scan callbacks - MISSING FIELDS! */
+    /* Index scan callbacks */
     .index_fetch_begin = NULL,
     .index_fetch_reset = NULL,
     .index_fetch_end = NULL,
     .index_fetch_tuple = NULL,
 
-    /* Non-modifying operations on individual tuples - MISSING FIELDS! */
+    /* Non-modifying operations on individual tuples */
     .tuple_fetch_row_version = NULL,
     .tuple_tid_valid = NULL,
     .tuple_get_latest_tid = NULL,
@@ -600,14 +739,13 @@ static const TableAmRoutine rocks_methods = {
     .relation_size = rocks_relation_size,
     .relation_needs_toast_table = rocks_relation_needs_toast_table,
 
-    /* MISSING FIELDS! */
     .relation_toast_am = NULL,
     .relation_fetch_toast_slice = NULL,
 
-    /* Planner related functions - MISSING FIELDS! */
+    /* Planner related functions */
     .relation_estimate_size = rocks_relation_estimate_size,
 
-    /* Executor related functions - MISSING FIELDS! */
+    /* Executor related functions */
     .scan_bitmap_next_block = NULL,
     .scan_bitmap_next_tuple = NULL,
     .scan_sample_next_block = NULL,
@@ -825,6 +963,9 @@ rocks_beginscan(Relation relation, Snapshot snapshot,
     
     elog(LOG, "rocks_beginscan called - creating scan with iterator");
     
+    /* Ensure any pending writes are flushed before scanning */
+    ensure_writes_flushed();
+    
     init_rocksdb();
     
     /* Use our custom scan structure */
@@ -862,10 +1003,7 @@ rocks_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
             bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
     elog(LOG, "rocks_rescan called");
-    /* For basic scan, we don't need to do anything special */
 }
-
-/* Row-based scanning - no chunk loading needed */
 
 static bool
 rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
@@ -945,7 +1083,6 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
 {
     Oid table_oid = RelationGetRelid(relation);
     uint64 rowid;
-    char *err = NULL;
     char *row_key;
     size_t row_key_len;
     char *row_data;
@@ -958,7 +1095,7 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     /* Ensure the slot is properly materialized */
     slot_getallattrs(slot);
     
-    /* Get next row ID */
+    /* Get next row ID (cached for performance) */
     rowid = get_next_row_id(table_oid);
     
     /* Serialize the complete row */
@@ -967,16 +1104,23 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     /* Create row key */
     row_key = make_row_key(table_oid, rowid, &row_key_len);
     
-    /* Store the serialized row in RocksDB */
-    rocksdb_put(rocks_db, rocks_write_options, row_key, row_key_len,
-                row_data, row_data_len, &err);
-    
-    if (err != NULL) {
-        elog(ERROR, "RocksDB put error for row data: %s", err);
-        free(err);
+    /* Initialize global batch if needed */
+    if (global_batch == NULL) {
+        global_batch = rocksdb_writebatch_create();
+        batch_size = 0;
     }
     
-    elog(LOG, "rocks_tuple_insert - successfully stored row %lu, data_len=%zu", rowid, row_data_len);
+    /* Add to batch instead of immediate write */
+    rocksdb_writebatch_put(global_batch, row_key, row_key_len, row_data, row_data_len);
+    batch_size++;
+    
+    /* Flush batch if it's getting large */
+    if (batch_size >= MAX_BATCH_SIZE) {
+        flush_write_batch();
+    }
+    
+    elog(LOG, "rocks_tuple_insert - added row %lu to batch (size=%d), data_len=%zu", 
+         rowid, batch_size, row_data_len);
     
     /* Cleanup */
     pfree(row_key);
@@ -1105,13 +1249,60 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
                   int ntuples, CommandId cid, int options,
                   BulkInsertState bistate)
 {
+    Oid table_oid = RelationGetRelid(relation);
+    rocksdb_writebatch_t* batch;
+    char *err = NULL;
     int i;
     
-    /* TODO: Implement multi-insert */
-    for (i = 0; i < ntuples; i++)
-    {
-        rocks_tuple_insert(relation, slots[i], cid, options, bistate);
+    elog(LOG, "rocks_multi_insert - inserting %d tuples for table_oid=%u", ntuples, table_oid);
+    
+    init_rocksdb();
+    
+    /* Create a write batch for optimal performance */
+    batch = rocksdb_writebatch_create();
+    
+    for (i = 0; i < ntuples; i++) {
+        uint64 rowid;
+        char *row_key;
+        size_t row_key_len;
+        char *row_data;
+        size_t row_data_len;
+        
+        /* Ensure the slot is properly materialized */
+        slot_getallattrs(slots[i]);
+        
+        /* Get next row ID (cached, no metadata write yet) */
+        rowid = get_next_row_id(table_oid);
+        
+        /* Serialize the complete row */
+        row_data = serialize_row(slots[i], &row_data_len);
+        
+        /* Create row key */
+        row_key = make_row_key(table_oid, rowid, &row_key_len);
+        
+        /* Add to batch */
+        rocksdb_writebatch_put(batch, row_key, row_key_len, row_data, row_data_len);
+        
+        /* Cleanup per-row allocations */
+        pfree(row_key);
+        pfree(row_data);
     }
+    
+    /* Execute the entire batch in one operation */
+    rocksdb_write(rocks_db, rocks_write_options, batch, &err);
+    
+    if (err != NULL) {
+        elog(ERROR, "RocksDB batch write error: %s", err);
+        free(err);
+    }
+    
+    /* Flush metadata once at the end */
+    flush_row_counter_metadata(table_oid);
+    
+    /* Cleanup */
+    rocksdb_writebatch_destroy(batch);
+    
+    elog(LOG, "rocks_multi_insert - successfully inserted %d tuples", ntuples);
 }
 
 static TM_Result
@@ -1172,7 +1363,17 @@ rocks_tuple_lock(Relation relation, ItemPointer tid,
 static void
 rocks_finish_bulk_insert(Relation relation, int options)
 {
-    /* TODO: Implement bulk insert completion */
+    Oid table_oid = RelationGetRelid(relation);
+    
+    elog(LOG, "rocks_finish_bulk_insert - finalizing bulk insert for table_oid=%u", table_oid);
+    
+    /* First flush any pending write batch */
+    flush_write_batch();
+    
+    /* Then ensure metadata is flushed */
+    flush_row_counter_metadata(table_oid);
+    
+    elog(LOG, "rocks_finish_bulk_insert - completed for table_oid=%u", table_oid);
 }
 
 /* Relation operations */
@@ -1364,7 +1565,6 @@ rocks_relation_size(Relation rel, ForkNumber forkNumber)
     /* Sum up storage size of all keys and values */
     while (rocksdb_iter_valid(iter)) {
         const char *key;
-        /* const char *value; -- unused in row storage */
         size_t key_len, value_len;
         
         key = rocksdb_iter_key(iter, &key_len);
