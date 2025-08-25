@@ -47,8 +47,7 @@ static rocksdb_writeoptions_t* rocks_write_options = NULL;
 /* Hash table for tracking speculative insertions */
 static HTAB* speculative_insertions = NULL;
 
-/* Simple global scan counter for debugging */
-static int global_scan_counter = 0;
+/* Global scan counter removed - was unused */
 
 /* Structure to track speculative insertions */
 typedef struct SpeculativeInsertEntry
@@ -456,62 +455,7 @@ get_next_row_id(Oid table_oid)
 
 /* Old column chunk deserialize functions removed */
 
-/* Deserialize stored tuple data from speculative insertion */
-static void
-deserialize_stored_tuple(char *data, size_t data_len, TupleTableSlot *slot)
-{
-    TupleDesc tupdesc = slot->tts_tupleDescriptor;
-    char *ptr = data;
-    int natts, i;
-    
-    /* Read number of attributes */
-    natts = *((int*)ptr);
-    ptr += sizeof(int);
-    
-    ExecClearTuple(slot);
-    
-    for (i = 0; i < natts && i < tupdesc->natts; i++) {
-        bool isnull = *((bool*)ptr);
-        ptr += sizeof(bool);
-        
-        slot->tts_isnull[i] = isnull;
-        
-        if (!isnull) {
-            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-            
-            switch (attr->atttypid) {
-                case INT4OID: {
-                    int32 val = *((int32*)ptr);
-                    ptr += sizeof(int32);
-                    slot->tts_values[i] = Int32GetDatum(val);
-                    break;
-                }
-                case INT8OID: {
-                    int64 val = *((int64*)ptr);
-                    ptr += sizeof(int64);
-                    slot->tts_values[i] = Int64GetDatum(val);
-                    break;
-                }
-                case TEXTOID:
-                case VARCHAROID: {
-                    int32 len = *((int32*)ptr);
-                    text *txt;
-                    
-                    ptr += sizeof(int32);
-                    txt = (text*)palloc(VARHDRSZ + len);
-                    SET_VARSIZE(txt, VARHDRSZ + len);
-                    memcpy(VARDATA(txt), ptr, len);
-                    ptr += len;
-                    
-                    slot->tts_values[i] = PointerGetDatum(txt);
-                    break;
-                }
-            }
-        }
-    }
-    
-    ExecStoreVirtualTuple(slot);
-}
+/* deserialize_stored_tuple function removed - was unused in row-based storage */
 
 /* Forward declarations */
 static const TupleTableSlotOps *rocks_slot_callbacks(Relation relation);
@@ -592,123 +536,9 @@ static void rocks_relation_estimate_size(Relation rel, int32 *attr_widths,
                                         double *allvisfrac);
 
 
-/* Minimal stub implementations for required functions */
-static void
-rocks_relation_copy_data_stub(Relation rel, const RelFileLocator *newrlocator)
-{
-    /* Stub implementation */
-}
+/* Stub implementations removed - using actual implementations now */
 
-static void
-rocks_relation_copy_for_cluster_stub(Relation OldTable, Relation NewTable,
-                                     Relation OldIndex, bool use_sort,
-                                     TransactionId OldestXmin,
-                                     TransactionId *xid_cutoff,
-                                     MultiXactId *multi_cutoff,
-                                     double *num_tuples,
-                                     double *tups_vacuumed,
-                                     double *tups_recently_dead)
-{
-    /* Stub implementation */
-}
-
-static void
-rocks_relation_vacuum_stub(Relation onerel, VacuumParams *params,
-                          BufferAccessStrategy bstrategy)
-{
-    /* Stub implementation */
-}
-
-static void
-rocks_finish_bulk_insert_stub(Relation relation, int options)
-{
-    /* Ensure metadata is updated at the end of bulk operations */
-    Oid table_oid = RelationGetRelid(relation);
-    TableMetadata *meta = get_table_metadata(table_oid, false);
-    
-    if (meta) {
-        /* Find the actual row count by scanning for the highest row ID */
-        char *prefix;
-        size_t prefix_len;
-        rocksdb_iterator_t *iter;
-        uint64 max_rowid = 0;
-        
-        prefix = make_row_prefix(table_oid, &prefix_len);
-        iter = rocksdb_create_iterator(rocks_db, rocks_read_options);
-        rocksdb_iter_seek(iter, prefix, prefix_len);
-        
-        /* Scan through all row mappings to find the highest row ID */
-        while (rocksdb_iter_valid(iter)) {
-            const char *key;
-            size_t key_len;
-            uint64 rowid;
-            
-            key = rocksdb_iter_key(iter, &key_len);
-            
-            /* Check if this key belongs to our table */
-            if (key_len < prefix_len || 
-                memcmp(key, prefix, prefix_len) != 0) {
-                break;
-            }
-            
-            /* Parse the row ID from the key: "row_<table_oid>_<rowid>" */
-            if (sscanf(key + prefix_len, "%lu", &rowid) == 1) {
-                if (rowid > max_rowid) {
-                    max_rowid = rowid;
-                }
-            }
-            
-            rocksdb_iter_next(iter);
-        }
-        
-        rocksdb_iter_destroy(iter);
-        pfree(prefix);
-        
-        /* Update metadata with the actual row count */
-        meta->row_count = max_rowid;
-        update_table_metadata(table_oid, meta);
-        pfree(meta);
-        
-        elog(LOG, "rocks_finish_bulk_insert: Updated metadata with row_count=%lu", max_rowid);
-    }
-}
-
-static TM_Result
-rocks_tuple_delete_stub(Relation relation, ItemPointer tid,
-                       CommandId cid, Snapshot snapshot,
-                       Snapshot crosscheck, bool wait,
-                       TM_FailureData *tmfd, bool changingPart)
-{
-    return TM_Ok;
-}
-
-static TM_Result
-rocks_tuple_update_stub(Relation relation, ItemPointer otid,
-                       TupleTableSlot *slot, CommandId cid,
-                       Snapshot snapshot, Snapshot crosscheck,
-                       bool wait, TM_FailureData *tmfd,
-                       LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
-{
-    return TM_Ok;
-}
-
-static TM_Result
-rocks_tuple_lock_stub(Relation relation, ItemPointer tid,
-                     Snapshot snapshot, TupleTableSlot *slot,
-                     CommandId cid, LockTupleMode mode,
-                     LockWaitPolicy wait_policy, uint8 flags,
-                     TM_FailureData *tmfd)
-{
-    return TM_Ok;
-}
-
-static void
-rocks_multi_insert_stub(Relation relation, TupleTableSlot **slots,
-                       int ntuples, CommandId cid, int options,
-                       BulkInsertState bistate)
-{
-    /* Stub implementation */
-}
+/* All stub functions removed - using actual implementations */
 
 /* Table access method routine structure - complete PostgreSQL 17 compatible version */
 static const TableAmRoutine rocks_methods = {
