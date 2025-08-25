@@ -66,62 +66,58 @@ typedef struct SpeculativeInsertEntry
 
 /* Remove scan state structure - using simple global counter for now */
 
-/* Storage format design - COLUMNAR STORAGE:
+/* Storage format design - ROW-BASED STORAGE:
  * Key format: 
- * - Column data: "col_<oid>_<col_idx>_<chunk_id>" -> [column_values]
- * - Metadata: "meta_<oid>_info" -> [row_count, col_count, chunk_size]
- * - Row mapping: "row_<oid>_<rowid>" -> [chunk_id, chunk_offset]
+ * - Row data: "row_<oid>_<rowid>" -> [serialized_row_data]
+ * - Metadata: "meta_<oid>_info" -> [row_count, col_count]
  * 
  * For each table, we store:
- * - "meta_<oid>_info" -> table metadata (row count, column count, chunk size)
- * - "col_<oid>_<col_idx>_<chunk_id>" -> column data chunks
- * - "row_<oid>_<rowid>" -> row to chunk mapping
+ * - "meta_<oid>_info" -> table metadata (row count, column count)
+ * - "row_<oid>_<rowid>" -> complete serialized row data
  */
 
-/* Columnar storage constants */
-#define CHUNK_SIZE 1000  /* Number of rows per chunk */
+/* Row storage constants */
+#define MAX_ROW_SIZE 8192  /* Maximum size for a serialized row */
 
-/* Column data structure */
-typedef struct ColumnChunk
+/* Row data structure */
+typedef struct RowData
 {
-    uint32 chunk_id;
-    uint32 row_count;
+    uint64 rowid;
     char *data;
     size_t data_len;
-} ColumnChunk;
+} RowData;
 
 /* Table metadata structure */
 typedef struct TableMetadata
 {
     uint64 row_count;
     uint32 column_count;
-    uint32 chunk_size;
     Oid column_types[MaxAttrNumber];
 } TableMetadata;
 
-/* Row mapping structure */
-typedef struct RowMapping
+/* Row header structure for serialized data */
+typedef struct RowHeader
 {
-    uint32 chunk_id;
-    uint32 chunk_offset;
-} RowMapping;
+    uint32 natts;      /* Number of attributes */
+    uint32 data_len;   /* Length of row data */
+} RowHeader;
 
-/* Helper function to create column data key */
+/* Helper function to create row data key */
 static char *
-make_column_key(Oid table_oid, uint32 col_idx, uint32 chunk_id, size_t *key_len)
-{
-    char *key = palloc(64);
-    *key_len = snprintf(key, 64, "col_%u_%u_%u", table_oid, col_idx, chunk_id);
-    return key;
-}
-
-/* Helper function to create row mapping key */
-static char *
-make_row_mapping_key(Oid table_oid, uint64 rowid, size_t *key_len)
+make_row_key(Oid table_oid, uint64 rowid, size_t *key_len)
 {
     char *key = palloc(64);
     *key_len = snprintf(key, 64, "row_%u_%lu", table_oid, rowid);
     return key;
+}
+
+/* Helper function to create key prefix for table scanning */
+static char *
+make_row_prefix(Oid table_oid, size_t *prefix_len)
+{
+    char *prefix = palloc(32);
+    *prefix_len = snprintf(prefix, 32, "row_%u_", table_oid);
+    return prefix;
 }
 
 /* Helper function to create metadata key */
@@ -133,35 +129,181 @@ make_metadata_key(Oid table_oid, size_t *key_len)
     return key;
 }
 
-/* Helper function to create key prefix for table scanning (row mappings) */
+/* Helper function to serialize a complete row */
 static char *
-make_table_prefix(Oid table_oid, size_t *prefix_len)
+serialize_row(TupleTableSlot *slot, size_t *data_len)
 {
-    char *prefix = palloc(32);
-    *prefix_len = snprintf(prefix, 32, "row_%u_", table_oid);
-    return prefix;
+    TupleDesc tupdesc = slot->tts_tupleDescriptor;
+    int natts = tupdesc->natts;
+    char *data, *ptr;
+    size_t total_size;
+    int i;
+    RowHeader header;
+    
+    /* Calculate total size needed */
+    total_size = sizeof(RowHeader) + natts * sizeof(bool); /* header + null bitmap */
+    
+    for (i = 0; i < natts; i++) {
+        if (!slot->tts_isnull[i]) {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            switch (attr->atttypid) {
+                case INT4OID:
+                    total_size += sizeof(int32);
+                    break;
+                case INT8OID:
+                    total_size += sizeof(int64);
+                    break;
+                case TEXTOID:
+                case VARCHAROID: {
+                    text *txt = DatumGetTextP(slot->tts_values[i]);
+                    total_size += sizeof(int32) + VARSIZE(txt) - VARHDRSZ;
+                    break;
+                }
+                default:
+                    elog(ERROR, "Unsupported data type during serialization: %u", attr->atttypid);
+            }
+        }
+    }
+    
+    /* Allocate buffer */
+    data = palloc(total_size);
+    ptr = data;
+    
+    /* Write header */
+    header.natts = natts;
+    header.data_len = total_size;
+    memcpy(ptr, &header, sizeof(RowHeader));
+    ptr += sizeof(RowHeader);
+    
+    /* Write null bitmap */
+    for (i = 0; i < natts; i++) {
+        *((bool*)ptr) = slot->tts_isnull[i];
+        ptr += sizeof(bool);
+    }
+    
+    /* Write attribute values */
+    for (i = 0; i < natts; i++) {
+        if (!slot->tts_isnull[i]) {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            switch (attr->atttypid) {
+                case INT4OID: {
+                    int32 val = DatumGetInt32(slot->tts_values[i]);
+                    memcpy(ptr, &val, sizeof(int32));
+                    ptr += sizeof(int32);
+                    break;
+                }
+                case INT8OID: {
+                    int64 val = DatumGetInt64(slot->tts_values[i]);
+                    memcpy(ptr, &val, sizeof(int64));
+                    ptr += sizeof(int64);
+                    break;
+                }
+                case TEXTOID:
+                case VARCHAROID: {
+                    text *txt = DatumGetTextP(slot->tts_values[i]);
+                    int32 len = VARSIZE(txt) - VARHDRSZ;
+                    memcpy(ptr, &len, sizeof(int32));
+                    ptr += sizeof(int32);
+                    memcpy(ptr, VARDATA(txt), len);
+                    ptr += len;
+                    break;
+                }
+                default:
+                    elog(ERROR, "Unsupported data type during serialization: %u", attr->atttypid);
+            }
+        }
+    }
+    
+    *data_len = total_size;
+    return data;
 }
 
-/* Custom scan descriptor for columnar storage */
+/* Helper function to deserialize a complete row */
+static void
+deserialize_row(char *data, size_t data_len, TupleTableSlot *slot)
+{
+    TupleDesc tupdesc = slot->tts_tupleDescriptor;
+    char *ptr = data;
+    RowHeader *header;
+    bool *null_bitmap;
+    int i;
+    
+    /* Read header */
+    header = (RowHeader *) ptr;
+    ptr += sizeof(RowHeader);
+    
+    /* Verify header */
+    if (header->natts != tupdesc->natts) {
+        elog(ERROR, "Row attribute count mismatch: expected %d, got %u", 
+             tupdesc->natts, header->natts);
+    }
+    
+    /* Read null bitmap */
+    null_bitmap = (bool *) ptr;
+    ptr += header->natts * sizeof(bool);
+    
+    /* Clear the slot */
+    ExecClearTuple(slot);
+    
+    /* Read attribute values */
+    for (i = 0; i < header->natts; i++) {
+        slot->tts_isnull[i] = null_bitmap[i];
+        
+        if (!null_bitmap[i]) {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            switch (attr->atttypid) {
+                case INT4OID: {
+                    int32 val;
+                    memcpy(&val, ptr, sizeof(int32));
+                    slot->tts_values[i] = Int32GetDatum(val);
+                    ptr += sizeof(int32);
+                    break;
+                }
+                case INT8OID: {
+                    int64 val;
+                    memcpy(&val, ptr, sizeof(int64));
+                    slot->tts_values[i] = Int64GetDatum(val);
+                    ptr += sizeof(int64);
+                    break;
+                }
+                case TEXTOID:
+                case VARCHAROID: {
+                    int32 len;
+                    text *txt;
+                    
+                    memcpy(&len, ptr, sizeof(int32));
+                    ptr += sizeof(int32);
+                    
+                    txt = (text *) palloc(VARHDRSZ + len);
+                    SET_VARSIZE(txt, VARHDRSZ + len);
+                    memcpy(VARDATA(txt), ptr, len);
+                    ptr += len;
+                    
+                    slot->tts_values[i] = PointerGetDatum(txt);
+                    break;
+                }
+                default:
+                    elog(ERROR, "Unsupported data type during deserialization: %u", attr->atttypid);
+            }
+        } else {
+            slot->tts_values[i] = (Datum) 0;
+        }
+    }
+    
+    /* Set slot as valid */
+    slot->tts_nvalid = header->natts;
+    ExecStoreVirtualTuple(slot);
+}
+
+/* Custom scan descriptor for row storage */
 typedef struct RocksScanDesc
 {
     TableScanDescData rs_base;
-    rocksdb_iterator_t *iterator;
     char *key_prefix;
     size_t key_prefix_len;
     uint64 current_rowid;
-    bool started;
-    
-    /* Columnar storage specific fields */
-    TableMetadata table_meta;
-    uint32 current_chunk_id;
-    uint32 current_chunk_offset;
-    ColumnChunk *current_chunks[MaxAttrNumber];
-    bool chunks_loaded;
-    
-    /* Scan state for table access method */
-    uint64 current_row_id;
     uint64 total_rows;
+    bool started;
 } RocksScanDesc;
 
 /* Function to initialize speculative insertions hash table */
@@ -245,7 +387,6 @@ get_table_metadata(Oid table_oid, bool create_if_missing)
         /* Initialize new table metadata */
         meta->row_count = 0;
         meta->column_count = 0;
-        meta->chunk_size = CHUNK_SIZE;
         
         /* Store the metadata */
         rocksdb_put(rocks_db, rocks_write_options, key, key_len,
@@ -285,198 +426,35 @@ update_table_metadata(Oid table_oid, TableMetadata *meta)
     pfree(key);
 }
 
-/* Get next row ID and chunk information */
-static void
-get_next_row_info(Oid table_oid, uint64 *rowid, uint32 *chunk_id, uint32 *chunk_offset)
+/* Get next row ID for insertion */
+static uint64
+get_next_row_id(Oid table_oid)
 {
     TableMetadata *meta = get_table_metadata(table_oid, true);
+    uint64 rowid;
     
     if (!meta) {
         elog(ERROR, "Failed to get table metadata for table %u", table_oid);
     }
     
-    if (meta->chunk_size == 0) {
-        meta->chunk_size = CHUNK_SIZE;
-    }
-    
-    *rowid = meta->row_count + 1;
-    
-    /* For now, use one row per chunk to avoid complexity - each row gets its own chunk_id */
-    *chunk_id = *rowid - 1;  /* Each row gets its own chunk ID for simplicity */
-    *chunk_offset = 0;       /* Always offset 0 since we have one row per chunk */
+    rowid = meta->row_count + 1;
     
     /* Update row count */
-    meta->row_count = *rowid;
+    meta->row_count = rowid;
     
     /* Update metadata after each row for correctness */
     update_table_metadata(table_oid, meta);
     elog(LOG, "Updated metadata: table_oid=%u, row_count=%lu", table_oid, meta->row_count);
     
     pfree(meta);
+    return rowid;
 }
 
-/* Serialize a single column value to binary format */
-static char *
-serialize_column_value(Datum value, Oid type_oid, bool isnull, size_t *data_len)
-{
-    char *data;
-    char *ptr;
-    
-    if (isnull) {
-        *data_len = 0;
-        return NULL;
-    }
-    
-    switch (type_oid) {
-        case INT4OID: {
-            int32 val = DatumGetInt32(value);
-            data = palloc(sizeof(int32));
-            *((int32*)data) = val;
-            *data_len = sizeof(int32);
-            break;
-        }
-        case INT8OID: {
-            int64 val = DatumGetInt64(value);
-            data = palloc(sizeof(int64));
-            *((int64*)data) = val;
-            *data_len = sizeof(int64);
-            break;
-        }
-        case TEXTOID:
-        case VARCHAROID: {
-            text *txt = DatumGetTextP(value);
-            int32 len = VARSIZE(txt) - VARHDRSZ;
-            data = palloc(sizeof(int32) + len);
-            ptr = data;
-            *((int32*)ptr) = len;
-            ptr += sizeof(int32);
-            memcpy(ptr, VARDATA(txt), len);
-            *data_len = sizeof(int32) + len;
-            break;
-        }
-        default:
-            elog(ERROR, "Unsupported data type: %u", type_oid);
-            *data_len = 0;
-            return NULL;
-    }
-    
-    return data;
-}
+/* Old column-based functions removed - using row-based storage now */
 
-/* Simplified serialize function for debugging - stores only single values */
-static char *
-serialize_column_chunk(Datum *values, bool *isnulls, Oid type_oid, int count, size_t *data_len)
-{
-    char *data;
-    size_t total_size;
-    
-    /* For now, handle only single values (count=1) */
-    if (count != 1) {
-        elog(ERROR, "serialize_column_chunk: only single values supported, got count=%d", count);
-    }
-    
-    if (isnulls[0]) {
-        /* Null value - store just a flag */
-        data = palloc(1);
-        data[0] = 1; /* NULL flag */
-        *data_len = 1;
-        return data;
-    }
-    
-    /* Non-null value - store type-specific data */
-    switch (type_oid) {
-        case INT4OID: {
-            int32 val = DatumGetInt32(values[0]);
-            data = palloc(1 + sizeof(int32));
-            data[0] = 0; /* Not-null flag */
-            memcpy(data + 1, &val, sizeof(int32));
-            *data_len = 1 + sizeof(int32);
-            break;
-        }
-        case TEXTOID:
-        case VARCHAROID: {
-            text *txt = DatumGetTextP(values[0]);
-            int32 len = VARSIZE(txt) - VARHDRSZ;
-            data = palloc(1 + sizeof(int32) + len);
-            data[0] = 0; /* Not-null flag */
-            memcpy(data + 1, &len, sizeof(int32));
-            memcpy(data + 1 + sizeof(int32), VARDATA(txt), len);
-            *data_len = 1 + sizeof(int32) + len;
-            break;
-        }
-        default:
-            elog(ERROR, "serialize_column_chunk: unsupported type %u", type_oid);
-            *data_len = 0;
-            return NULL;
-    }
-    
-    return data;
-}
+/* Old column chunk functions removed */
 
-/* Deserialize a column chunk */
-static void
-deserialize_column_chunk(char *data, size_t data_len, Oid type_oid, 
-                        Datum *values, bool *isnulls, int count)
-{
-    char *ptr = data;
-    uint32 stored_count;
-    int bitmap_size;
-    char *bitmap;
-    int i;
-    
-    /* Read chunk header */
-    stored_count = *((uint32*)ptr);
-    ptr += sizeof(uint32);
-    
-    if (stored_count != count) {
-        elog(ERROR, "Column chunk count mismatch: expected %d, got %u", count, stored_count);
-    }
-    
-    /* Read null bitmap */
-    bitmap_size = (count + 7) / 8;
-    bitmap = ptr;
-    ptr += bitmap_size;
-    
-    /* Parse null bitmap and values */
-    for (i = 0; i < count; i++) {
-        isnulls[i] = (bitmap[i / 8] & (1 << (i % 8))) != 0;
-        
-        if (!isnulls[i]) {
-            switch (type_oid) {
-                case INT4OID: {
-                    int32 val = *((int32*)ptr);
-                    values[i] = Int32GetDatum(val);
-                    ptr += sizeof(int32);
-                    break;
-                }
-                case INT8OID: {
-                    int64 val = *((int64*)ptr);
-                    values[i] = Int64GetDatum(val);
-                    ptr += sizeof(int64);
-                    break;
-                }
-                case TEXTOID:
-                case VARCHAROID: {
-                    int32 len = *((int32*)ptr);
-                    text *txt;
-                    
-                    ptr += sizeof(int32);
-                    txt = (text*)palloc(VARHDRSZ + len);
-                    SET_VARSIZE(txt, VARHDRSZ + len);
-                    memcpy(VARDATA(txt), ptr, len);
-                    ptr += len;
-                    
-                    values[i] = PointerGetDatum(txt);
-                    break;
-                }
-                default:
-                    elog(ERROR, "Unsupported data type during deserialization: %u", type_oid);
-            }
-        } else {
-            values[i] = (Datum)0; /* Null value */
-        }
-    }
-}
+/* Old column chunk deserialize functions removed */
 
 /* Deserialize stored tuple data from speculative insertion */
 static void
@@ -655,7 +633,7 @@ rocks_finish_bulk_insert_stub(Relation relation, int options)
         rocksdb_iterator_t *iter;
         uint64 max_rowid = 0;
         
-        prefix = make_table_prefix(table_oid, &prefix_len);
+        prefix = make_row_prefix(table_oid, &prefix_len);
         iter = rocksdb_create_iterator(rocks_db, rocks_read_options);
         rocksdb_iter_seek(iter, prefix, prefix_len);
         
@@ -663,6 +641,7 @@ rocks_finish_bulk_insert_stub(Relation relation, int options)
         while (rocksdb_iter_valid(iter)) {
             const char *key;
             size_t key_len;
+            uint64 rowid;
             
             key = rocksdb_iter_key(iter, &key_len);
             
@@ -673,7 +652,6 @@ rocks_finish_bulk_insert_stub(Relation relation, int options)
             }
             
             /* Parse the row ID from the key: "row_<table_oid>_<rowid>" */
-            uint64 rowid = 0;
             if (sscanf(key + prefix_len, "%lu", &rowid) == 1) {
                 if (rowid > max_rowid) {
                     max_rowid = rowid;
@@ -769,24 +747,24 @@ static const TableAmRoutine rocks_methods = {
 
     /* Manipulations of physical tuples */
     .tuple_insert = rocks_tuple_insert,
-    .tuple_insert_speculative = NULL,
-    .tuple_complete_speculative = NULL,
-    .multi_insert = NULL,
-    .tuple_delete = NULL,
-    .tuple_update = NULL,
-    .tuple_lock = NULL,
-    .finish_bulk_insert = rocks_finish_bulk_insert_stub,
+    .tuple_insert_speculative = rocks_tuple_insert_speculative,
+    .tuple_complete_speculative = rocks_tuple_complete_speculative,
+    .multi_insert = rocks_multi_insert,
+    .tuple_delete = rocks_tuple_delete,
+    .tuple_update = rocks_tuple_update,
+    .tuple_lock = rocks_tuple_lock,
+    .finish_bulk_insert = rocks_finish_bulk_insert,
 
     /* DDL related functionality */
     .relation_set_new_filelocator = rocks_relation_set_new_filelocator,
-    .relation_nontransactional_truncate = NULL,
-    .relation_copy_data = NULL,
-    .relation_copy_for_cluster = NULL,
-    .relation_vacuum = NULL,
-    .scan_analyze_next_block = NULL,
-    .scan_analyze_next_tuple = NULL,
-    .index_build_range_scan = NULL,
-    .index_validate_scan = NULL,
+    .relation_nontransactional_truncate = rocks_relation_nontransactional_truncate,
+    .relation_copy_data = rocks_relation_copy_data,
+    .relation_copy_for_cluster = rocks_relation_copy_for_cluster,
+    .relation_vacuum = rocks_relation_vacuum,
+    .scan_analyze_next_block = rocks_scan_analyze_next_block,
+    .scan_analyze_next_tuple = rocks_scan_analyze_next_tuple,
+    .index_build_range_scan = rocks_index_build_range_scan,
+    .index_validate_scan = rocks_index_validate_scan,
 
     /* Miscellaneous functions */
     .relation_size = rocks_relation_size,
@@ -918,69 +896,54 @@ postgresrocks_read_data(PG_FUNCTION_ARGS)
         uint64 rowid = call_cntr + 1;
         char *row_key;
         size_t row_key_len;
-        char *value;
-        size_t value_len;
+        char *row_data;
+        size_t row_data_len;
         char *err = NULL;
-        RowMapping row_map;
-        char *col_key_id, *col_key_name;
-        size_t col_key_id_len, col_key_name_len;
-        char *col_data_id, *col_data_name;
-        size_t col_data_id_len, col_data_name_len;
+        RowHeader *header;
+        bool *null_bitmap;
+        char *data_ptr;
         
-        /* Get row mapping */
-        row_key = make_row_mapping_key(table_oid, rowid, &row_key_len);
-        value = rocksdb_get(rocks_db, rocks_read_options, row_key, row_key_len, &value_len, &err);
+        /* Get row data */
+        row_key = make_row_key(table_oid, rowid, &row_key_len);
+        row_data = rocksdb_get(rocks_db, rocks_read_options, row_key, row_key_len, &row_data_len, &err);
         
-        if (err != NULL || value == NULL) {
+        if (err != NULL || row_data == NULL) {
             pfree(row_key);
             if (err) free(err);
             SRF_RETURN_DONE(funcctx);
         }
         
-        /* Parse row mapping */
-        memcpy(&row_map, value, sizeof(RowMapping));
-        free(value);
-        pfree(row_key);
-        
-        /* Get column data for ID (column 0) */
-        col_key_id = make_column_key(table_oid, 0, row_map.chunk_id, &col_key_id_len);
-        col_data_id = rocksdb_get(rocks_db, rocks_read_options, col_key_id, col_key_id_len, &col_data_id_len, &err);
-        
-        /* Get column data for name (column 1) */
-        col_key_name = make_column_key(table_oid, 1, row_map.chunk_id, &col_key_name_len);
-        col_data_name = rocksdb_get(rocks_db, rocks_read_options, col_key_name, col_key_name_len, &col_data_name_len, &err);
+        /* Parse row header */
+        header = (RowHeader *) row_data;
+        null_bitmap = (bool *) (row_data + sizeof(RowHeader));
+        data_ptr = row_data + sizeof(RowHeader) + header->natts * sizeof(bool);
         
         /* Build a tuple with actual data */
         values = (char **) palloc(2 * sizeof(char *));
         
-        /* Extract ID from column chunk using simplified format */
-        if (col_data_id && col_data_id_len > 0) {
-            if (col_data_id[0] == 1) {
-                /* NULL value */
-                values[0] = pstrdup("NULL");
-            } else {
-                /* Non-null integer value */
-                int32 id_value;
-                memcpy(&id_value, col_data_id + 1, sizeof(int32));
-                values[0] = psprintf("%d", id_value);
-            }
+        /* Extract ID (column 0) */
+        if (null_bitmap[0]) {
+            values[0] = pstrdup("NULL");
         } else {
-            values[0] = pstrdup("0");
+            int32 id_value;
+            memcpy(&id_value, data_ptr, sizeof(int32));
+            values[0] = psprintf("%d", id_value);
+            data_ptr += sizeof(int32);
         }
         
-        /* Extract name from column chunk using simplified format */
-        if (col_data_name && col_data_name_len > 0) {
-            if (col_data_name[0] == 1) {
-                /* NULL value */
+        /* Extract name (column 1) */
+        if (header->natts > 1) {
+            if (null_bitmap[1]) {
                 values[1] = pstrdup("NULL");
             } else {
-                /* Non-null text value */
                 int32 text_len;
                 char *text_data;
                 
-                memcpy(&text_len, col_data_name + 1, sizeof(int32));
+                memcpy(&text_len, data_ptr, sizeof(int32));
+                data_ptr += sizeof(int32);
+                
                 text_data = palloc(text_len + 1);
-                memcpy(text_data, col_data_name + 1 + sizeof(int32), text_len);
+                memcpy(text_data, data_ptr, text_len);
                 text_data[text_len] = '\0';
                 values[1] = text_data;
             }
@@ -989,10 +952,8 @@ postgresrocks_read_data(PG_FUNCTION_ARGS)
         }
         
         /* Clean up */
-        pfree(col_key_id);
-        pfree(col_key_name);
-        if (col_data_id) free(col_data_id);
-        if (col_data_name) free(col_data_name);
+        pfree(row_key);
+        free(row_data);
         
         /* Build the tuple */
         tuple = BuildTupleFromCStrings(attinmeta, values);
@@ -1046,7 +1007,7 @@ rocks_beginscan(Relation relation, Snapshot snapshot,
     
     /* Initialize scan state */
     table_oid = RelationGetRelid(relation);
-    scan->key_prefix = make_table_prefix(table_oid, &scan->key_prefix_len);
+    scan->key_prefix = make_row_prefix(table_oid, &scan->key_prefix_len);
     scan->current_rowid = 1;  /* Start from first row */
     scan->started = false;
     
@@ -1074,65 +1035,7 @@ rocks_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
     /* For basic scan, we don't need to do anything special */
 }
 
-/* Load column chunks for the current chunk ID */
-static void
-load_column_chunks(RocksScanDesc *scan, Relation relation)
-{
-    Oid table_oid;
-    TupleDesc tupdesc;
-    int natts;
-    int i;
-    char *key;
-    size_t key_len;
-    char *value, *err;
-    size_t value_len;
-    
-    if (scan->chunks_loaded) {
-        return;
-    }
-    
-    table_oid = RelationGetRelid(relation);
-    tupdesc = relation->rd_att;
-    natts = tupdesc->natts;
-    
-    /* Clear any existing chunks */
-    for (i = 0; i < MaxAttrNumber; i++) {
-        if (scan->current_chunks[i]) {
-            pfree(scan->current_chunks[i]->data);
-            pfree(scan->current_chunks[i]);
-            scan->current_chunks[i] = NULL;
-        }
-    }
-    
-    /* Load each column chunk */
-    for (i = 0; i < natts; i++) {
-        key = make_column_key(table_oid, i, scan->current_chunk_id, &key_len);
-        err = NULL;
-        
-        value = rocksdb_get(rocks_db, rocks_read_options, key, key_len, &value_len, &err);
-        
-        if (err != NULL) {
-            elog(ERROR, "RocksDB get error: %s", err);
-            free(err);
-        }
-        
-        if (value != NULL && value_len > 0) {
-            scan->current_chunks[i] = palloc(sizeof(ColumnChunk));
-            scan->current_chunks[i]->chunk_id = scan->current_chunk_id;
-            scan->current_chunks[i]->data = value;
-            scan->current_chunks[i]->data_len = value_len;
-            scan->current_chunks[i]->row_count = 1; /* For now, single values */
-        } else {
-            scan->current_chunks[i] = NULL;
-        }
-        
-        pfree(key);
-    }
-    
-    scan->chunks_loaded = true;
-}
-
-/* RocksScanDesc already defined above with the fields we need */
+/* Row-based scanning - no chunk loading needed */
 
 static bool
 rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
@@ -1141,14 +1044,10 @@ rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
     RocksScanDesc *scan = (RocksScanDesc *) sscan;
     Relation relation = scan->rs_base.rs_rd;
     Oid table_oid = RelationGetRelid(relation);
-    TupleDesc tupdesc = RelationGetDescr(relation);
-    int natts = tupdesc->natts;
     char *row_key;
     size_t row_key_len;
     char *row_data, *err;
     size_t row_data_len;
-    RowMapping *row_map;
-    int col_idx;
     
     elog(LOG, "rocks_getnextslot called - current_rowid=%lu, total_rows=%lu", 
          scan->current_rowid, scan->total_rows);
@@ -1159,13 +1058,13 @@ rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
         return false;
     }
     
-    /* Get row mapping for current row */
-    row_key = make_row_mapping_key(table_oid, scan->current_rowid, &row_key_len);
+    /* Get row data for current row */
+    row_key = make_row_key(table_oid, scan->current_rowid, &row_key_len);
     err = NULL;
     row_data = rocksdb_get(rocks_db, rocks_read_options, row_key, row_key_len, &row_data_len, &err);
     
     if (err != NULL) {
-        elog(ERROR, "RocksDB get error for row mapping: %s", err);
+        elog(ERROR, "RocksDB get error for row data: %s", err);
         free(err);
     }
     
@@ -1176,81 +1075,11 @@ rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
         return rocks_getnextslot(sscan, direction, slot);  /* Try next row */
     }
     
-    row_map = (RowMapping *) row_data;
-    elog(LOG, "rocks_getnextslot - found row %lu in chunk %u, offset %u", 
-         scan->current_rowid, row_map->chunk_id, row_map->chunk_offset);
+    elog(LOG, "rocks_getnextslot - found row %lu, data_len=%zu", 
+         scan->current_rowid, row_data_len);
     
-    /* Clear the slot */
-    ExecClearTuple(slot);
-    
-    /* Fetch column data for each attribute */
-    for (col_idx = 0; col_idx < natts; col_idx++) {
-        Form_pg_attribute attr = TupleDescAttr(tupdesc, col_idx);
-        Oid type_oid = attr->atttypid;
-        char *col_key;
-        size_t col_key_len;
-        char *col_data;
-        size_t col_data_len;
-        Datum value;
-        bool isnull;
-        
-        /* Get column data */
-        col_key = make_column_key(table_oid, col_idx, row_map->chunk_id, &col_key_len);
-        err = NULL;
-        col_data = rocksdb_get(rocks_db, rocks_read_options, col_key, col_key_len, &col_data_len, &err);
-        
-        if (err != NULL) {
-            elog(ERROR, "RocksDB get error for column data: %s", err);
-            free(err);
-        }
-        
-        if (col_data == NULL || col_data_len == 0) {
-            /* Column not found - treat as NULL */
-            slot->tts_values[col_idx] = (Datum) 0;
-            slot->tts_isnull[col_idx] = true;
-        } else {
-            /* Deserialize column data */
-            if (col_data[0] == 1) {
-                /* NULL flag */
-                slot->tts_values[col_idx] = (Datum) 0;
-                slot->tts_isnull[col_idx] = true;
-            } else {
-                /* Non-null data */
-                isnull = false;
-                switch (type_oid) {
-                    case INT4OID: {
-                        int32 val;
-                        memcpy(&val, col_data + 1, sizeof(int32));
-                        value = Int32GetDatum(val);
-                        break;
-                    }
-                    case TEXTOID:
-                    case VARCHAROID: {
-                        int32 len;
-                        memcpy(&len, col_data + 1, sizeof(int32));
-                        text *txt = (text *) palloc(VARHDRSZ + len);
-                        SET_VARSIZE(txt, VARHDRSZ + len);
-                        memcpy(VARDATA(txt), col_data + 1 + sizeof(int32), len);
-                        value = PointerGetDatum(txt);
-                        break;
-                    }
-                    default:
-                        elog(ERROR, "rocks_getnextslot: unsupported type %u", type_oid);
-                        value = (Datum) 0;
-                        isnull = true;
-                }
-                slot->tts_values[col_idx] = value;
-                slot->tts_isnull[col_idx] = isnull;
-            }
-        }
-        
-        pfree(col_key);
-        if (col_data) free(col_data);
-    }
-    
-    /* Set slot as valid */
-    slot->tts_nvalid = natts;
-    ExecStoreVirtualTuple(slot);
+    /* Deserialize the complete row into the slot */
+    deserialize_row(row_data, row_data_len, slot);
     
     /* Move to next row */
     scan->current_rowid++;
@@ -1259,7 +1088,7 @@ rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
     pfree(row_key);
     free(row_data);
     
-    elog(LOG, "rocks_getnextslot - returning row with %d columns", natts);
+    elog(LOG, "rocks_getnextslot - successfully deserialized row %lu", scan->current_rowid - 1);
     return true;
 }
 
@@ -1286,92 +1115,42 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
 {
     Oid table_oid = RelationGetRelid(relation);
     uint64 rowid;
-    uint32 chunk_id, chunk_offset;
-    
-    elog(LOG, "rocks_tuple_insert - table_oid=%u", table_oid);
     char *err = NULL;
-    TupleDesc tupdesc = slot->tts_tupleDescriptor;
-    int natts = tupdesc->natts;
-    int col_idx;
-    RowMapping row_map;
     char *row_key;
     size_t row_key_len;
-    Form_pg_attribute attr;
-    Oid type_oid;
-    char *col_key;
-    size_t col_key_len;
-    Datum values[1];
-    bool isnulls[1];
-    size_t data_len;
-    char *data;
+    char *row_data;
+    size_t row_data_len;
+    
+    elog(LOG, "rocks_tuple_insert - table_oid=%u", table_oid);
     
     init_rocksdb();
     
     /* Ensure the slot is properly materialized */
     slot_getallattrs(slot);
     
-    /* Get next row ID and chunk information */
-    get_next_row_info(table_oid, &rowid, &chunk_id, &chunk_offset);
+    /* Get next row ID */
+    rowid = get_next_row_id(table_oid);
     
-    /* Store row mapping */
-    row_map.chunk_id = chunk_id;
-    row_map.chunk_offset = chunk_offset;
-    row_key = make_row_mapping_key(table_oid, rowid, &row_key_len);
+    /* Serialize the complete row */
+    row_data = serialize_row(slot, &row_data_len);
     
+    /* Create row key */
+    row_key = make_row_key(table_oid, rowid, &row_key_len);
+    
+    /* Store the serialized row in RocksDB */
     rocksdb_put(rocks_db, rocks_write_options, row_key, row_key_len,
-                (char*)&row_map, sizeof(RowMapping), &err);
+                row_data, row_data_len, &err);
     
     if (err != NULL) {
-        elog(ERROR, "RocksDB put error for row mapping: %s", err);
+        elog(ERROR, "RocksDB put error for row data: %s", err);
         free(err);
     }
     
-    /* Store column values in chunks */
-    for (col_idx = 0; col_idx < natts; col_idx++) {
-        elog(LOG, "Starting to process column %d", col_idx);
-        attr = TupleDescAttr(tupdesc, col_idx);
-        elog(LOG, "Got TupleDescAttr for column %d", col_idx);
-        type_oid = attr->atttypid;
-        elog(LOG, "Got type_oid %u for column %d", type_oid, col_idx);
-        
-        /* Create column chunk key */
-        elog(LOG, "About to create column key for col %d, table_oid=%u, chunk_id=%u", col_idx, table_oid, chunk_id);
-        col_key = make_column_key(table_oid, col_idx, chunk_id, &col_key_len);
-        elog(LOG, "Created column key for col %d, key_len=%zu", col_idx, col_key_len);
-        
-        /* For now, store single values (will be optimized later) */
-        elog(LOG, "About to access slot values for column %d", col_idx);
-        values[0] = slot->tts_values[col_idx];
-        elog(LOG, "Got slot value for column %d", col_idx);
-        isnulls[0] = slot->tts_isnull[col_idx];
-        elog(LOG, "Got slot isnull for column %d", col_idx);
-        
-        data = serialize_column_chunk(values, isnulls, type_oid, 1, &data_len);
-        
-        /* Debug: Log what we're storing */
-        elog(LOG, "Storing column %d: data_len=%zu, type_oid=%u, value=%s, first_byte=%d", 
-             col_idx, data_len, type_oid, 
-             isnulls[0] ? "NULL" : (type_oid == INT4OID ? "INT" : "TEXT"),
-             data_len > 0 ? (int)data[0] : -1);
-        
-        /* Store in RocksDB */
-        elog(LOG, "About to call rocksdb_put for column %d", col_idx);
-        rocksdb_put(rocks_db, rocks_write_options, col_key, col_key_len,
-                    data, data_len, &err);
-        elog(LOG, "rocksdb_put completed for column %d", col_idx);
-        
-        if (err != NULL) {
-            elog(ERROR, "RocksDB put error for column data: %s", err);
-            free(err);
-        }
-        
-        elog(LOG, "About to pfree for column %d", col_idx);
-        pfree(col_key);
-        pfree(data);
-        elog(LOG, "Completed processing column %d", col_idx);
-    }
+    elog(LOG, "rocks_tuple_insert - successfully stored row %lu, data_len=%zu", rowid, row_data_len);
     
+    /* Cleanup */
     pfree(row_key);
+    pfree(row_data);
 }
 
 static void
@@ -1382,19 +1161,16 @@ rocks_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 {
     Oid table_oid = RelationGetRelid(relation);
     uint64 rowid;
-    uint32 chunk_id, chunk_offset;
-    TupleDesc tupdesc = slot->tts_tupleDescriptor;
-    int natts = tupdesc->natts;
     SpeculativeInsertEntry *entry;
     bool found;
-    size_t total_size;
-    char *ptr;
-    int i;
     
     init_rocksdb();
     
-    /* Get next row ID and chunk information */
-    get_next_row_info(table_oid, &rowid, &chunk_id, &chunk_offset);
+    /* Ensure the slot is properly materialized */
+    slot_getallattrs(slot);
+    
+    /* Get next row ID */
+    rowid = get_next_row_id(table_oid);
     
     /* Store the speculative insertion in our hash table (not RocksDB yet) */
     entry = (SpeculativeInsertEntry *) hash_search(speculative_insertions,
@@ -1414,76 +1190,14 @@ rocks_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
     entry->specToken = specToken;
     entry->table_oid = table_oid;
     entry->rowid = rowid;
-    entry->chunk_id = chunk_id;
-    entry->chunk_offset = chunk_offset;
+    entry->chunk_id = 0;  /* Not used in row storage */
+    entry->chunk_offset = 0;  /* Not used in row storage */
     
-    /* Store row mapping key */
-    entry->key = make_row_mapping_key(table_oid, rowid, &entry->key_len);
+    /* Store row key */
+    entry->key = make_row_key(table_oid, rowid, &entry->key_len);
     
-    /* Store the original tuple data for later reconstruction */
-    /* Calculate size needed for tuple data */
-    total_size = sizeof(int) + natts * sizeof(bool);
-    for (i = 0; i < natts; i++) {
-        if (!slot->tts_isnull[i]) {
-            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-            switch (attr->atttypid) {
-                case INT4OID:
-                    total_size += sizeof(int32);
-                    break;
-                case INT8OID:
-                    total_size += sizeof(int64);
-                    break;
-                case TEXTOID:
-                case VARCHAROID: {
-                    text *txt = DatumGetTextP(slot->tts_values[i]);
-                    total_size += sizeof(int32) + VARSIZE(txt) - VARHDRSZ;
-                    break;
-                }
-            }
-        }
-    }
-    
-    /* Allocate and serialize tuple data */
-    entry->data = palloc(total_size);
-    entry->data_len = total_size;
-    
-    ptr = entry->data;
-    *((int*)ptr) = natts;
-    ptr += sizeof(int);
-    
-    for (i = 0; i < natts; i++) {
-        bool isnull = slot->tts_isnull[i];
-        *((bool*)ptr) = isnull;
-        ptr += sizeof(bool);
-        
-        if (!isnull) {
-            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-            switch (attr->atttypid) {
-                case INT4OID: {
-                    int32 val = DatumGetInt32(slot->tts_values[i]);
-                    *((int32*)ptr) = val;
-                    ptr += sizeof(int32);
-                    break;
-                }
-                case INT8OID: {
-                    int64 val = DatumGetInt64(slot->tts_values[i]);
-                    *((int64*)ptr) = val;
-                    ptr += sizeof(int64);
-                    break;
-                }
-                case TEXTOID:
-                case VARCHAROID: {
-                    text *txt = DatumGetTextP(slot->tts_values[i]);
-                    int32 len = VARSIZE(txt) - VARHDRSZ;
-                    *((int32*)ptr) = len;
-                    ptr += sizeof(int32);
-                    memcpy(ptr, VARDATA(txt), len);
-                    ptr += len;
-                    break;
-                }
-            }
-        }
-    }
+    /* Serialize the complete row data for storage */
+    entry->data = serialize_row(slot, &entry->data_len);
     
     /* 
      * Do NOT insert into RocksDB yet - this is speculative!
@@ -1499,19 +1213,6 @@ rocks_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
     SpeculativeInsertEntry *entry;
     bool found;
     char *err = NULL;
-    TupleTableSlot temp_slot;
-    RowMapping row_map;
-    TupleDesc tupdesc;
-    int natts;
-    int col_idx;
-    Form_pg_attribute attr;
-    Oid type_oid;
-    char *col_key;
-    size_t col_key_len;
-    Datum values[1];
-    bool isnulls[1];
-    size_t data_len;
-    char *data;
     Oid table_oid;
     TableMetadata *meta;
     
@@ -1532,54 +1233,16 @@ rocks_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
         /* 
          * Speculation succeeded - commit the insertion to RocksDB 
          */
-        /* First, reconstruct the tuple from stored data */
-        temp_slot.tts_tupleDescriptor = slot->tts_tupleDescriptor;
-        temp_slot.tts_values = slot->tts_values;
-        temp_slot.tts_isnull = slot->tts_isnull;
-        
-        deserialize_stored_tuple(entry->data, entry->data_len, &temp_slot);
-        
-        /* Store row mapping */
-        row_map.chunk_id = entry->chunk_id;
-        row_map.chunk_offset = entry->chunk_offset;
         rocksdb_put(rocks_db, rocks_write_options, 
                    entry->key, entry->key_len,
-                   (char*)&row_map, sizeof(RowMapping), &err);
+                   entry->data, entry->data_len, &err);
         
         if (err != NULL) {
             elog(ERROR, "RocksDB put error during speculative completion: %s", err);
             free(err);
         }
         
-        /* Store column values in chunks */
-        tupdesc = slot->tts_tupleDescriptor;
-        natts = tupdesc->natts;
-        
-        for (col_idx = 0; col_idx < natts; col_idx++) {
-            attr = TupleDescAttr(tupdesc, col_idx);
-            type_oid = attr->atttypid;
-            
-            /* Create column chunk key */
-            col_key = make_column_key(entry->table_oid, col_idx, entry->chunk_id, &col_key_len);
-            
-            /* For now, store single values (will be optimized later) */
-            values[0] = temp_slot.tts_values[col_idx];
-            isnulls[0] = temp_slot.tts_isnull[col_idx];
-            
-            data = serialize_column_chunk(values, isnulls, type_oid, 1, &data_len);
-            
-            /* Store in RocksDB */
-            rocksdb_put(rocks_db, rocks_write_options, col_key, col_key_len,
-                        data, data_len, &err);
-            
-            if (err != NULL) {
-                elog(ERROR, "RocksDB put error for column data: %s", err);
-                free(err);
-            }
-            
-            pfree(col_key);
-            pfree(data);
-        }
+        elog(LOG, "Speculative insertion succeeded for row %lu", entry->rowid);
     } else {
         /*
          * Speculation failed - we need to "undo" the row ID allocation
@@ -1588,12 +1251,13 @@ rocks_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
         table_oid = entry->table_oid;
         meta = get_table_metadata(table_oid, false);
         
-        if (meta->row_count > 0) {
+        if (meta && meta->row_count > 0) {
             meta->row_count--;
             update_table_metadata(table_oid, meta);
+            pfree(meta);
         }
         
-        pfree(meta);
+        elog(LOG, "Speculative insertion failed for row %lu", entry->rowid);
     }
     
     /* Clean up the speculative entry */
@@ -1637,7 +1301,7 @@ rocks_tuple_delete(Relation relation, ItemPointer tid,
     rowid = ItemPointerGetBlockNumber(tid) * BLCKSZ + ItemPointerGetOffsetNumber(tid);
     
     /* Create key for this row */
-    key = make_row_mapping_key(table_oid, rowid, &key_len);
+    key = make_row_key(table_oid, rowid, &key_len);
     
     /* Delete from RocksDB */
     rocksdb_delete(rocks_db, rocks_write_options, key, key_len, &err);
@@ -1729,7 +1393,7 @@ rocks_relation_nontransactional_truncate(Relation rel)
     init_rocksdb();
     
     /* Create prefix for this table's data */
-    prefix = make_table_prefix(table_oid, &prefix_len);
+    prefix = make_row_prefix(table_oid, &prefix_len);
     
     /* Create iterator to find all keys for this table */
     iter = rocksdb_create_iterator(rocks_db, rocks_read_options);
@@ -1861,7 +1525,7 @@ rocks_relation_size(Relation rel, ForkNumber forkNumber)
     init_rocksdb();
     
     /* Create prefix for this table's data */
-    prefix = make_table_prefix(table_oid, &prefix_len);
+    prefix = make_row_prefix(table_oid, &prefix_len);
     
     /* Create iterator to scan all keys for this table */
     iter = rocksdb_create_iterator(rocks_db, rocks_read_options);
@@ -1869,7 +1533,8 @@ rocks_relation_size(Relation rel, ForkNumber forkNumber)
     
     /* Sum up storage size of all keys and values */
     while (rocksdb_iter_valid(iter)) {
-        const char *key, *value;
+        const char *key;
+        /* const char *value; -- unused in row storage */
         size_t key_len, value_len;
         
         key = rocksdb_iter_key(iter, &key_len);
@@ -1880,7 +1545,7 @@ rocks_relation_size(Relation rel, ForkNumber forkNumber)
             break;
         }
         
-        value = rocksdb_iter_value(iter, &value_len);
+        rocksdb_iter_value(iter, &value_len);
         total_size += key_len + value_len;
         
         rocksdb_iter_next(iter);

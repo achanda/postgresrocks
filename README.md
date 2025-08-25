@@ -1,35 +1,42 @@
 # PostgresRocks
 
-A PostgreSQL extension that implements a custom table access method using RocksDB as the storage engine with **columnar storage format**.
+A PostgreSQL extension that implements a custom table access method using RocksDB as the storage engine.
 
 ## Storage Format
 
-### Columnar Architecture
-
-The extension uses a **columnar storage format** where data is organized by columns rather than rows:
+The extension uses a row-based storage format where complete rows are stored:
 
 ```
-Columnar Storage:
-┌─────────┬─────────┐
-│ Col 1   │ Col 2   │
-├─────────┼─────────┤
-│ A, C    │ B, D    │
-└─────────┴─────────┘
+Row-Based Storage:
+┌─────────────────────────┐
+│ Row 1: [A, B, metadata] │
+│ Row 2: [C, D, metadata] │
+│ Row 3: [E, F, metadata] │
+└─────────────────────────┘
 ```
 
 ### Key Structure
 
-- **Column Data**: `col_<table_oid>_<column_index>_<chunk_id>` → [column_values]
-- **Metadata**: `meta_<table_oid>_info` → [row_count, column_count, chunk_size]
-- **Row Mapping**: `row_<table_oid>_<row_id>` → [chunk_id, chunk_offset]
+- **Row Data**: `row_<table_oid>_<row_id>` → [complete_serialized_row]
+- **Metadata**: `meta_<table_oid>_info` → [row_count, column_count, column_types]
 
 ### Data Organization
 
-1. **Chunked Storage**: Data is divided into chunks of 1000 rows for efficient access
-2. **Column Compression**: Similar data types are stored together for better compression
-3. **Null Bitmap**: Efficient null value representation using bitmaps
-4. **Type-Aware Serialization**: Optimized binary format for each data type
+1. **Complete Row Storage**: Each row is stored as a single, self-contained unit
+2. **Binary Serialization**: Efficient binary format with row header and typed data
+3. **Null Bitmap**: Compact null value representation
+4. **Type-Aware Format**: Optimized serialization for INT4, INT8, TEXT, and VARCHAR
+5. **Simple Key Schema**: Direct row lookup without complex mapping
 
+### Row Format
+
+Each serialized row contains:
+```
+┌─────────────┬─────────────┬─────────────────┐
+│ Row Header  │ Null Bitmap │ Attribute Data  │
+│ (metadata)  │ (per attr)  │ (typed values)  │
+└─────────────┴─────────────┴─────────────────┘
+```
 
 ## Prerequisites
 
@@ -65,8 +72,9 @@ export PG_CONFIG=/opt/homebrew/bin/pg_config
 export MACOSX_DEPLOYMENT_TARGET=11.0
 
 # Build and install
+make clean
 make
-sudo make install
+make install
 
 # Create extension in PostgreSQL
 psql -d postgres -c "CREATE EXTENSION postgresrocks;"
@@ -96,20 +104,35 @@ SELECT * FROM test_table WHERE value > 150;
 
 ### Supported Data Types
 
-- **Integers**: `INTEGER`, `BIGINT`
+- **Integers**: `INTEGER` (INT4), `BIGINT` (INT8)
 - **Text**: `TEXT`, `VARCHAR`
+- **Constraints**: `UNIQUE` constraints with speculative insertion support
 
 ## Testing
 
-After installation, test the extension:
+After installation, run the comprehensive test suite:
+
+```bash
+# Run all tests
+psql postgres -f test.sql
+```
+
+Or test manually:
 
 ```sql
 -- Test basic functionality
 CREATE TABLE test (id INT, name TEXT) USING postgresrocks;
-INSERT INTO test VALUES (1, 'Hello'), (2, 'World');
+INSERT INTO test VALUES (1, 'Hello'), (2, 'World'), (3, 'RocksDB');
 SELECT * FROM test;
+SELECT * FROM test WHERE id > 1;
+SELECT name FROM test;
 
--- Test speculative insertion
-CREATE TABLE test_unique (id INT UNIQUE, name TEXT) USING postgresrocks;
-INSERT INTO test_unique VALUES (1, 'First') ON CONFLICT (id) DO NOTHING;
+-- Test data persistence
+SELECT postgresrocks_read_data('test');
+
+-- Test speculative insertion (used by ON CONFLICT)
+CREATE TABLE test_unique (id INT UNIQUE, value TEXT) USING postgresrocks;
+INSERT INTO test_unique VALUES (1, 'first');
+INSERT INTO test_unique VALUES (2, 'second');
+SELECT * FROM test_unique;
 ```
