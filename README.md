@@ -85,12 +85,19 @@ psql -d postgres -c "CREATE EXTENSION postgresrocks;"
 ### Create Tables
 
 ```sql
+-- Optional: choose the default layout hint for new tables in this session
+SET postgresrocks.default_layout = 'hybrid';
+
 -- Create a table using the postgresrocks storage engine
 CREATE TABLE test_table (
     id SERIAL,
     name TEXT,
     value INTEGER
 ) USING postgresrocks;
+
+-- Inspect or override the persisted layout hint later
+SELECT postgresrocks_get_table_layout('test_table');
+SELECT postgresrocks_set_table_layout('test_table', 'row');
 
 -- Insert data
 INSERT INTO test_table (name, value) VALUES 
@@ -107,6 +114,16 @@ SELECT * FROM test_table WHERE value > 150;
 - **Integers**: `INTEGER` (INT4), `BIGINT` (INT8)
 - **Text**: `TEXT`, `VARCHAR`
 - **Constraints**: `UNIQUE` constraints with speculative insertion support
+
+### Layout Hints
+
+The extension now accepts a user-provided layout hint for each table:
+
+- `row`: best fit for point reads and whole-row OLTP access
+- `hybrid`: intended for mixed workloads
+- `column`: intended for scan-heavy analytics
+
+Today, PostgresRocks persists and exposes the hint, but still executes through the row-store code path while hybrid/column storage is being built out.
 
 ## Testing
 

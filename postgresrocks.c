@@ -31,6 +31,7 @@
 #include "access/multixact.h"
 #include "access/attnum.h"
 #include "storage/bufpage.h"
+#include "utils/guc.h"
 
 #include <rocksdb/c.h>
 #include <string.h>
@@ -38,11 +39,26 @@
 
 PG_MODULE_MAGIC;
 
+#ifdef POSTGRESROCKS_DEBUG
+#define PR_LOG(...) elog(LOG, __VA_ARGS__)
+#define PR_DEBUG_ONLY(stmt) do { stmt; } while (0)
+#else
+#define PR_LOG(...) ((void) 0)
+#define PR_DEBUG_ONLY(stmt) ((void) 0)
+#endif
+
 /* Global RocksDB instance */
 static rocksdb_t* rocks_db = NULL;
 static rocksdb_options_t* rocks_options = NULL;
 static rocksdb_readoptions_t* rocks_read_options = NULL;
 static rocksdb_writeoptions_t* rocks_write_options = NULL;
+static char *postgresrocks_default_layout = "row";
+static bool postgresrocks_benchmark_write_mode = false;
+static char *serialize_buffer = NULL;
+static size_t serialize_buffer_capacity = 0;
+static uint64 postgresrocks_tuple_insert_calls = 0;
+static uint64 postgresrocks_multi_insert_calls = 0;
+static uint64 postgresrocks_multi_inserted_tuples = 0;
 
 /* Hash table for tracking speculative insertions */
 static HTAB* speculative_insertions = NULL;
@@ -63,17 +79,24 @@ typedef struct SpeculativeInsertEntry
 
 
 /* Storage format design - ROW-BASED STORAGE:
- * Key format: 
- * - Row data: "row_<oid>_<rowid>" -> [serialized_row_data]
+ * Key format:
+ * - Row data: [tag=1][table_oid_be][rowid_be] -> [serialized_row_data]
  * - Metadata: "meta_<oid>_info" -> [row_count, col_count]
  * 
  * For each table, we store:
  * - "meta_<oid>_info" -> table metadata (row count, column count)
- * - "row_<oid>_<rowid>" -> complete serialized row data
+ * - row key [tag=1][table_oid_be][rowid_be] -> complete serialized row data
  */
 
 /* Row storage constants */
 #define MAX_ROW_SIZE 8192  /* Maximum size for a serialized row */
+
+typedef enum StorageLayout
+{
+    STORAGE_LAYOUT_ROW = 0,
+    STORAGE_LAYOUT_HYBRID = 1,
+    STORAGE_LAYOUT_COLUMN = 2
+} StorageLayout;
 
 /* Row data structure */
 typedef struct RowData
@@ -88,6 +111,7 @@ typedef struct TableMetadata
 {
     uint64 row_count;
     uint32 column_count;
+    uint32 layout;
     Oid column_types[MaxAttrNumber];
 } TableMetadata;
 
@@ -98,22 +122,160 @@ typedef struct RowHeader
     uint32 data_len;   /* Length of row data */
 } RowHeader;
 
+#define ROW_KEY_TAG 0x01
+#define ROW_KEY_LEN (1 + sizeof(uint32) + sizeof(uint64))
+#define ROW_PREFIX_LEN (1 + sizeof(uint32))
+
+static TableMetadata *get_table_metadata(Oid table_oid, bool create_if_missing);
+static void update_table_metadata(Oid table_oid, TableMetadata *meta);
+
+void _PG_init(void);
+
+static StorageLayout
+parse_storage_layout(const char *layout_name)
+{
+    if (layout_name == NULL || strcmp(layout_name, "row") == 0)
+        return STORAGE_LAYOUT_ROW;
+    if (strcmp(layout_name, "hybrid") == 0)
+        return STORAGE_LAYOUT_HYBRID;
+    if (strcmp(layout_name, "column") == 0)
+        return STORAGE_LAYOUT_COLUMN;
+
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("invalid postgresrocks layout \"%s\"", layout_name),
+             errhint("Valid values are \"row\", \"hybrid\", and \"column\".")));
+}
+
+static const char *
+storage_layout_name(StorageLayout layout)
+{
+    switch (layout)
+    {
+        case STORAGE_LAYOUT_ROW:
+            return "row";
+        case STORAGE_LAYOUT_HYBRID:
+            return "hybrid";
+        case STORAGE_LAYOUT_COLUMN:
+            return "column";
+    }
+
+    return "row";
+}
+
+static StorageLayout
+get_effective_table_layout(Relation relation)
+{
+    TableMetadata *meta;
+    StorageLayout layout = parse_storage_layout(postgresrocks_default_layout);
+
+    meta = get_table_metadata(RelationGetRelid(relation), false);
+    if (meta != NULL)
+    {
+        layout = (StorageLayout) meta->layout;
+        pfree(meta);
+    }
+
+    return layout;
+}
+
+static void
+configure_write_options(void)
+{
+    if (rocks_write_options == NULL)
+        return;
+
+    rocksdb_writeoptions_set_sync(rocks_write_options, 0);
+    rocksdb_writeoptions_disable_WAL(rocks_write_options,
+                                     postgresrocks_benchmark_write_mode ? 1 : 0);
+    rocksdb_writeoptions_set_no_slowdown(rocks_write_options,
+                                         postgresrocks_benchmark_write_mode ? 1 : 0);
+    rocksdb_writeoptions_set_low_pri(rocks_write_options, 0);
+    rocksdb_writeoptions_set_memtable_insert_hint_per_batch(rocks_write_options,
+                                                            postgresrocks_benchmark_write_mode ? 1 : 0);
+}
+
+void
+_PG_init(void)
+{
+    DefineCustomStringVariable("postgresrocks.default_layout",
+                               "Default storage layout hint for new postgresrocks tables.",
+                               "Accepted values are row, hybrid, and column.",
+                               &postgresrocks_default_layout,
+                               "row",
+                               PGC_USERSET,
+                               0,
+                               NULL,
+                               NULL,
+                               NULL);
+
+    DefineCustomBoolVariable("postgresrocks.benchmark_write_mode",
+                             "Use faster but less durable RocksDB write settings.",
+                             "When enabled, WAL is disabled for RocksDB writes and batch hints are enabled.",
+                             &postgresrocks_benchmark_write_mode,
+                             false,
+                             PGC_USERSET,
+                             0,
+                             NULL,
+                             NULL,
+                             NULL);
+}
+
 /* Helper function to create row data key */
+static inline void
+encode_u32_be(unsigned char *dest, uint32 value)
+{
+    dest[0] = (unsigned char) ((value >> 24) & 0xFF);
+    dest[1] = (unsigned char) ((value >> 16) & 0xFF);
+    dest[2] = (unsigned char) ((value >> 8) & 0xFF);
+    dest[3] = (unsigned char) (value & 0xFF);
+}
+
+static inline void
+encode_u64_be(unsigned char *dest, uint64 value)
+{
+    dest[0] = (unsigned char) ((value >> 56) & 0xFF);
+    dest[1] = (unsigned char) ((value >> 48) & 0xFF);
+    dest[2] = (unsigned char) ((value >> 40) & 0xFF);
+    dest[3] = (unsigned char) ((value >> 32) & 0xFF);
+    dest[4] = (unsigned char) ((value >> 24) & 0xFF);
+    dest[5] = (unsigned char) ((value >> 16) & 0xFF);
+    dest[6] = (unsigned char) ((value >> 8) & 0xFF);
+    dest[7] = (unsigned char) (value & 0xFF);
+}
+
 static char *
 make_row_key(Oid table_oid, uint64 rowid, size_t *key_len)
 {
-    char *key = palloc(64);
-    *key_len = snprintf(key, 64, "row_%u_%lu", table_oid, rowid);
-    return key;
+    unsigned char *key = (unsigned char *) palloc(ROW_KEY_LEN);
+
+    key[0] = ROW_KEY_TAG;
+    encode_u32_be(key + 1, (uint32) table_oid);
+    encode_u64_be(key + 1 + sizeof(uint32), rowid);
+    *key_len = ROW_KEY_LEN;
+
+    return (char *) key;
+}
+
+static inline void
+fill_row_key(unsigned char *key, Oid table_oid, uint64 rowid)
+{
+    key[0] = ROW_KEY_TAG;
+    encode_u32_be(key + 1, (uint32) table_oid);
+    encode_u64_be(key + 1 + sizeof(uint32), rowid);
 }
 
 /* Helper function to create key prefix for table scanning */
 static char *
 make_row_prefix(Oid table_oid, size_t *prefix_len)
 {
-    char *prefix = palloc(32);
-    *prefix_len = snprintf(prefix, 32, "row_%u_", table_oid);
-    return prefix;
+    unsigned char *prefix = (unsigned char *) palloc(ROW_PREFIX_LEN);
+
+    prefix[0] = ROW_KEY_TAG;
+    encode_u32_be(prefix + 1, (uint32) table_oid);
+    *prefix_len = ROW_PREFIX_LEN;
+
+    return (char *) prefix;
 }
 
 /* Helper function to create metadata key */
@@ -214,6 +376,100 @@ serialize_row(TupleTableSlot *slot, size_t *data_len)
     return data;
 }
 
+static char *
+serialize_row_reuse(TupleTableSlot *slot, size_t *data_len)
+{
+    TupleDesc tupdesc = slot->tts_tupleDescriptor;
+    int natts = tupdesc->natts;
+    char *data, *ptr;
+    size_t total_size;
+    int i;
+    RowHeader header;
+
+    total_size = sizeof(RowHeader) + natts * sizeof(bool);
+
+    for (i = 0; i < natts; i++) {
+        if (!slot->tts_isnull[i]) {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            switch (attr->atttypid) {
+                case INT4OID:
+                    total_size += sizeof(int32);
+                    break;
+                case INT8OID:
+                    total_size += sizeof(int64);
+                    break;
+                case TEXTOID:
+                case VARCHAROID: {
+                    text *txt = DatumGetTextP(slot->tts_values[i]);
+                    total_size += sizeof(int32) + VARSIZE(txt) - VARHDRSZ;
+                    break;
+                }
+                default:
+                    elog(ERROR, "Unsupported data type during serialization: %u", attr->atttypid);
+            }
+        }
+    }
+
+    if (serialize_buffer_capacity < total_size) {
+        size_t new_capacity = Max(total_size, serialize_buffer_capacity == 0 ? 1024 : serialize_buffer_capacity * 2);
+
+        if (serialize_buffer == NULL)
+            serialize_buffer = MemoryContextAlloc(TopMemoryContext, new_capacity);
+        else
+            serialize_buffer = repalloc(serialize_buffer, new_capacity);
+
+        serialize_buffer_capacity = new_capacity;
+    }
+
+    data = serialize_buffer;
+    ptr = data;
+
+    header.natts = natts;
+    header.data_len = total_size;
+    memcpy(ptr, &header, sizeof(RowHeader));
+    ptr += sizeof(RowHeader);
+
+    for (i = 0; i < natts; i++) {
+        *((bool*)ptr) = slot->tts_isnull[i];
+        ptr += sizeof(bool);
+    }
+
+    for (i = 0; i < natts; i++) {
+        if (!slot->tts_isnull[i]) {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            switch (attr->atttypid) {
+                case INT4OID: {
+                    int32 val = DatumGetInt32(slot->tts_values[i]);
+                    memcpy(ptr, &val, sizeof(int32));
+                    ptr += sizeof(int32);
+                    break;
+                }
+                case INT8OID: {
+                    int64 val = DatumGetInt64(slot->tts_values[i]);
+                    memcpy(ptr, &val, sizeof(int64));
+                    ptr += sizeof(int64);
+                    break;
+                }
+                case TEXTOID:
+                case VARCHAROID: {
+                    text *txt = DatumGetTextP(slot->tts_values[i]);
+                    int32 len = VARSIZE(txt) - VARHDRSZ;
+                    memcpy(ptr, &len, sizeof(int32));
+                    ptr += sizeof(int32);
+                    memcpy(ptr, VARDATA(txt), len);
+                    ptr += len;
+                    break;
+                }
+                default:
+                    elog(ERROR, "Unsupported data type during serialization: %u", attr->atttypid);
+            }
+        }
+    }
+
+    *data_len = total_size;
+    return data;
+}
+
 /* Helper function to deserialize a complete row */
 static void
 deserialize_row(char *data, size_t data_len, TupleTableSlot *slot)
@@ -297,6 +553,7 @@ typedef struct RocksScanDesc
     TableScanDescData rs_base;
     char *key_prefix;
     size_t key_prefix_len;
+    rocksdb_iterator_t *iter;
     uint64 current_rowid;
     uint64 total_rows;
     bool started;
@@ -334,10 +591,11 @@ init_rocksdb(void)
     
     rocks_options = rocksdb_options_create();
     rocksdb_options_set_create_if_missing(rocks_options, 1);
-    rocksdb_options_set_compression(rocks_options, rocksdb_snappy_compression);
+    rocksdb_options_set_compression(rocks_options, rocksdb_no_compression);
     
     rocks_read_options = rocksdb_readoptions_create();
     rocks_write_options = rocksdb_writeoptions_create();
+    configure_write_options();
     
     /* Open database in PostgreSQL data directory */
     rocks_db = rocksdb_open(rocks_options, "postgresrocks_data", &err);
@@ -427,7 +685,7 @@ static HTAB* row_counters = NULL;
 /* Global write batch for accumulating single inserts */
 static rocksdb_writebatch_t* global_batch = NULL;
 static int batch_size = 0;
-#define MAX_BATCH_SIZE 1000
+#define MAX_BATCH_SIZE 10000
 
 typedef struct RowCounterEntry
 {
@@ -483,18 +741,22 @@ get_next_row_id(Oid table_oid)
         entry->table_oid = table_oid;
         entry->next_rowid = meta->row_count + 1;
         entry->dirty = false;
-        elog(LOG, "Initialized row counter: table_oid=%u, next_rowid=%lu, row_count=%lu", 
-             table_oid, entry->next_rowid, meta->row_count);
+        PR_LOG("Initialized row counter: table_oid=%u, next_rowid=%llu, row_count=%llu",
+             table_oid, (unsigned long long) entry->next_rowid,
+             (unsigned long long) meta->row_count);
         pfree(meta);
     } else {
-        elog(LOG, "Found existing row counter: table_oid=%u, next_rowid=%lu, dirty=%s", 
-             table_oid, entry->next_rowid, entry->dirty ? "true" : "false");
+        PR_LOG("Found existing row counter: table_oid=%u, next_rowid=%llu, dirty=%s",
+             table_oid, (unsigned long long) entry->next_rowid,
+             entry->dirty ? "true" : "false");
     }
     
     rowid = entry->next_rowid++;
     entry->dirty = true;
     
-    elog(LOG, "Assigned row ID %lu for table %u (next will be %lu)", rowid, table_oid, entry->next_rowid);
+    PR_LOG("Assigned row ID %llu for table %u (next will be %llu)",
+         (unsigned long long) rowid, table_oid,
+         (unsigned long long) entry->next_rowid);
     return rowid;
 }
 
@@ -505,11 +767,11 @@ flush_write_batch(void)
     char *err = NULL;
     
     if (global_batch == NULL || batch_size == 0) {
-        elog(LOG, "flush_write_batch called but no batch to flush");
+        PR_LOG("flush_write_batch called but no batch to flush");
         return;
     }
     
-    elog(LOG, "About to flush write batch with %d operations", batch_size);
+    PR_LOG("About to flush write batch with %d operations", batch_size);
     
     /* Execute the accumulated batch */
     rocksdb_write(rocks_db, rocks_write_options, global_batch, &err);
@@ -520,7 +782,7 @@ flush_write_batch(void)
         return;
     }
     
-    elog(LOG, "Successfully flushed write batch with %d accumulated operations", batch_size);
+    PR_LOG("Successfully flushed write batch with %d accumulated operations", batch_size);
     
     /* Reset batch */
     rocksdb_writebatch_clear(global_batch);
@@ -534,7 +796,7 @@ static void
 ensure_writes_flushed(void)
 {
     if (global_batch != NULL && batch_size > 0) {
-        elog(LOG, "Forcing flush of pending writes before scan operation");
+        PR_LOG("Forcing flush of pending writes before scan operation");
         flush_write_batch();
     }
     
@@ -546,7 +808,7 @@ ensure_writes_flushed(void)
         hash_seq_init(&status, row_counters);
         while ((entry = hash_seq_search(&status)) != NULL) {
             if (entry->dirty) {
-                elog(LOG, "Flushing dirty row counter for table_oid=%u before scan", entry->table_oid);
+                PR_LOG("Flushing dirty row counter for table_oid=%u before scan", entry->table_oid);
                 flush_row_counter_metadata(entry->table_oid);
             }
         }
@@ -561,13 +823,13 @@ flush_row_counter_metadata(Oid table_oid)
     bool found;
     TableMetadata *meta;
     
-    elog(LOG, "flush_row_counter_metadata called for table_oid=%u", table_oid);
+    PR_LOG("flush_row_counter_metadata called for table_oid=%u", table_oid);
     
     /* First flush any pending writes */
     flush_write_batch();
     
     if (row_counters == NULL) {
-        elog(LOG, "Row counters hash table is NULL");
+        PR_LOG("Row counters hash table is NULL");
         return;
     }
     
@@ -577,17 +839,19 @@ flush_row_counter_metadata(Oid table_oid)
                                            &found);
     
     if (!found) {
-        elog(LOG, "No row counter entry found for table_oid=%u", table_oid);
+        PR_LOG("No row counter entry found for table_oid=%u", table_oid);
         return;
     }
     
     if (!entry->dirty) {
-        elog(LOG, "Row counter for table_oid=%u is not dirty (next_rowid=%lu)", table_oid, entry->next_rowid);
+        PR_LOG("Row counter for table_oid=%u is not dirty (next_rowid=%llu)",
+             table_oid, (unsigned long long) entry->next_rowid);
         return;
     }
     
-    elog(LOG, "Found dirty row counter: table_oid=%u, next_rowid=%lu, will set row_count=%lu", 
-         table_oid, entry->next_rowid, entry->next_rowid - 1);
+    PR_LOG("Found dirty row counter: table_oid=%u, next_rowid=%llu, will set row_count=%llu",
+         table_oid, (unsigned long long) entry->next_rowid,
+         (unsigned long long) (entry->next_rowid - 1));
     
     meta = get_table_metadata(table_oid, true);
     if (meta) {
@@ -595,7 +859,8 @@ flush_row_counter_metadata(Oid table_oid)
         update_table_metadata(table_oid, meta);
         pfree(meta);
         entry->dirty = false;
-        elog(LOG, "Successfully flushed metadata: table_oid=%u, row_count=%lu", table_oid, meta->row_count);
+        PR_LOG("Successfully flushed metadata: table_oid=%u, row_count=%llu",
+             table_oid, (unsigned long long) meta->row_count);
     } else {
         elog(ERROR, "Failed to get table metadata for flushing");
     }
@@ -746,7 +1011,6 @@ static const TableAmRoutine rocks_methods = {
     .relation_estimate_size = rocks_relation_estimate_size,
 
     /* Executor related functions */
-    .scan_bitmap_next_block = NULL,
     .scan_bitmap_next_tuple = NULL,
     .scan_sample_next_block = NULL,
     .scan_sample_next_tuple = NULL,
@@ -757,7 +1021,7 @@ PG_FUNCTION_INFO_V1(postgresrocks_tableam_handler);
 Datum
 postgresrocks_tableam_handler(PG_FUNCTION_ARGS)
 {
-    elog(LOG, "postgresrocks_tableam_handler called - returning TableAmRoutine");
+    PR_LOG("postgresrocks_tableam_handler called - returning TableAmRoutine");
     PG_RETURN_POINTER(&rocks_methods);
 }
 
@@ -936,18 +1200,81 @@ postgresrocks_read_data(PG_FUNCTION_ARGS)
     }
 }
 
+PG_FUNCTION_INFO_V1(postgresrocks_set_table_layout);
+Datum
+postgresrocks_set_table_layout(PG_FUNCTION_ARGS)
+{
+    Oid table_oid = PG_GETARG_OID(0);
+    text *layout_text = PG_GETARG_TEXT_P(1);
+    char *layout_name = text_to_cstring(layout_text);
+    StorageLayout layout = parse_storage_layout(layout_name);
+    TableMetadata *meta;
+
+    init_rocksdb();
+
+    meta = get_table_metadata(table_oid, true);
+    meta->layout = (uint32) layout;
+    update_table_metadata(table_oid, meta);
+    pfree(meta);
+
+    PG_RETURN_TEXT_P(cstring_to_text(storage_layout_name(layout)));
+}
+
+PG_FUNCTION_INFO_V1(postgresrocks_get_table_layout);
+Datum
+postgresrocks_get_table_layout(PG_FUNCTION_ARGS)
+{
+    Oid table_oid = PG_GETARG_OID(0);
+    TableMetadata *meta;
+    StorageLayout layout = parse_storage_layout(postgresrocks_default_layout);
+
+    init_rocksdb();
+
+    meta = get_table_metadata(table_oid, false);
+    if (meta != NULL)
+    {
+        layout = (StorageLayout) meta->layout;
+        pfree(meta);
+    }
+
+    PG_RETURN_TEXT_P(cstring_to_text(storage_layout_name(layout)));
+}
+
+PG_FUNCTION_INFO_V1(postgresrocks_reset_insert_stats);
+Datum
+postgresrocks_reset_insert_stats(PG_FUNCTION_ARGS)
+{
+    postgresrocks_tuple_insert_calls = 0;
+    postgresrocks_multi_insert_calls = 0;
+    postgresrocks_multi_inserted_tuples = 0;
+
+    PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(postgresrocks_insert_stats);
+Datum
+postgresrocks_insert_stats(PG_FUNCTION_ARGS)
+{
+    TupleDesc tupdesc;
+    Datum values[3];
+    bool nulls[3] = {false, false, false};
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "return type must be a row type");
+
+    values[0] = Int64GetDatum((int64) postgresrocks_tuple_insert_calls);
+    values[1] = Int64GetDatum((int64) postgresrocks_multi_insert_calls);
+    values[2] = Int64GetDatum((int64) postgresrocks_multi_inserted_tuples);
+
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
 /* Slot callbacks - use heap tuple table slots for compatibility */
 static const TupleTableSlotOps *
 rocks_slot_callbacks(Relation relation)
 {
-    elog(LOG, "rocks_slot_callbacks called - START");
-    if (relation) {
-        elog(LOG, "rocks_slot_callbacks for relation %s", RelationGetRelationName(relation));
-    } else {
-        elog(LOG, "rocks_slot_callbacks called with NULL relation");
-    }
-    elog(LOG, "rocks_slot_callbacks returning TTSOpsHeapTuple");
-    return &TTSOpsHeapTuple;
+    PR_LOG("rocks_slot_callbacks returning TTSOpsVirtual");
+    return &TTSOpsVirtual;
 }
 
 /* Scan operations */
@@ -961,7 +1288,7 @@ rocks_beginscan(Relation relation, Snapshot snapshot,
     Oid table_oid;
     TableMetadata *meta;
     
-    elog(LOG, "rocks_beginscan called - creating scan with iterator");
+    PR_LOG("rocks_beginscan called - creating scan with iterator");
     
     /* Ensure any pending writes are flushed before scanning */
     ensure_writes_flushed();
@@ -979,21 +1306,30 @@ rocks_beginscan(Relation relation, Snapshot snapshot,
     /* Initialize scan state */
     table_oid = RelationGetRelid(relation);
     scan->key_prefix = make_row_prefix(table_oid, &scan->key_prefix_len);
+    scan->iter = rocksdb_create_iterator(rocks_db, rocks_read_options);
     scan->current_rowid = 1;  /* Start from first row */
     scan->started = false;
+    PR_DEBUG_ONLY(
+        StorageLayout layout = get_effective_table_layout(relation);
+        if (layout != STORAGE_LAYOUT_ROW)
+            PR_LOG("layout hint for relation %s is \"%s\"; using row-store scan path until alternative layouts are implemented",
+                   RelationGetRelationName(relation), storage_layout_name(layout));
+    );
     
     /* Get table metadata to know how many rows we have */
     meta = get_table_metadata(table_oid, false);
     if (meta) {
         scan->total_rows = meta->row_count;
-        elog(LOG, "rocks_beginscan - found metadata: table_oid=%u, row_count=%lu", table_oid, meta->row_count);
+        PR_LOG("rocks_beginscan - found metadata: table_oid=%u, row_count=%llu",
+             table_oid, (unsigned long long) meta->row_count);
         pfree(meta);
     } else {
         scan->total_rows = 0;
-        elog(LOG, "rocks_beginscan - NO metadata found for table_oid=%u", table_oid);
+        PR_LOG("rocks_beginscan - NO metadata found for table_oid=%u", table_oid);
     }
     
-    elog(LOG, "rocks_beginscan completed - scan ready, total_rows=%lu", scan->total_rows);
+    PR_LOG("rocks_beginscan completed - scan ready, total_rows=%llu",
+         (unsigned long long) scan->total_rows);
     
     return (TableScanDesc) scan;
 }
@@ -1002,7 +1338,7 @@ static void
 rocks_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
             bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
-    elog(LOG, "rocks_rescan called");
+    PR_LOG("rocks_rescan called");
 }
 
 static bool
@@ -1010,53 +1346,46 @@ rocks_getnextslot(TableScanDesc sscan, ScanDirection direction,
                  TupleTableSlot *slot)
 {
     RocksScanDesc *scan = (RocksScanDesc *) sscan;
-    Relation relation = scan->rs_base.rs_rd;
-    Oid table_oid = RelationGetRelid(relation);
-    char *row_key;
-    size_t row_key_len;
-    char *row_data, *err;
+    char *row_data;
+    const char *key;
+    size_t key_len;
     size_t row_data_len;
     
-    elog(LOG, "rocks_getnextslot called - current_rowid=%lu, total_rows=%lu", 
-         scan->current_rowid, scan->total_rows);
+    PR_LOG("rocks_getnextslot called - current_rowid=%llu, total_rows=%llu",
+         (unsigned long long) scan->current_rowid,
+         (unsigned long long) scan->total_rows);
     
-    /* Check if we've scanned all rows */
-    if (scan->current_rowid > scan->total_rows) {
-        elog(LOG, "rocks_getnextslot - no more rows, returning false");
+    if (!scan->started) {
+        rocksdb_iter_seek(scan->iter, scan->key_prefix, scan->key_prefix_len);
+        scan->started = true;
+    }
+
+    if (!rocksdb_iter_valid(scan->iter)) {
+        PR_LOG("rocks_getnextslot - iterator exhausted, returning false");
         return false;
     }
-    
-    /* Get row data for current row */
-    row_key = make_row_key(table_oid, scan->current_rowid, &row_key_len);
-    err = NULL;
-    row_data = rocksdb_get(rocks_db, rocks_read_options, row_key, row_key_len, &row_data_len, &err);
-    
-    if (err != NULL) {
-        elog(ERROR, "RocksDB get error for row data: %s", err);
-        free(err);
+
+    key = rocksdb_iter_key(scan->iter, &key_len);
+    if (key_len < scan->key_prefix_len ||
+        memcmp(key, scan->key_prefix, scan->key_prefix_len) != 0) {
+        PR_LOG("rocks_getnextslot - prefix no longer matches, returning false");
+        return false;
     }
-    
-    if (row_data == NULL) {
-        elog(LOG, "rocks_getnextslot - row %lu not found, skipping", scan->current_rowid);
-        scan->current_rowid++;
-        pfree(row_key);
-        return rocks_getnextslot(sscan, direction, slot);  /* Try next row */
-    }
-    
-    elog(LOG, "rocks_getnextslot - found row %lu, data_len=%zu", 
-         scan->current_rowid, row_data_len);
+
+    row_data = (char *) rocksdb_iter_value(scan->iter, &row_data_len);
+
+    PR_LOG("rocks_getnextslot - found row %llu, data_len=%zu",
+         (unsigned long long) scan->current_rowid, row_data_len);
     
     /* Deserialize the complete row into the slot */
     deserialize_row(row_data, row_data_len, slot);
     
     /* Move to next row */
     scan->current_rowid++;
+    rocksdb_iter_next(scan->iter);
     
-    /* Cleanup */
-    pfree(row_key);
-    free(row_data);
-    
-    elog(LOG, "rocks_getnextslot - successfully deserialized row %lu", scan->current_rowid - 1);
+    PR_LOG("rocks_getnextslot - successfully deserialized row %llu",
+         (unsigned long long) (scan->current_rowid - 1));
     return true;
 }
 
@@ -1065,9 +1394,12 @@ rocks_endscan(TableScanDesc sscan)
 {
     RocksScanDesc *scan = (RocksScanDesc *) sscan;
     
-    elog(LOG, "rocks_endscan called");
+    PR_LOG("rocks_endscan called");
     if (scan) {
         /* Cleanup scan state */
+        if (scan->iter) {
+            rocksdb_iter_destroy(scan->iter);
+        }
         if (scan->key_prefix) {
             pfree(scan->key_prefix);
         }
@@ -1083,26 +1415,32 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
 {
     Oid table_oid = RelationGetRelid(relation);
     uint64 rowid;
-    char *row_key;
-    size_t row_key_len;
+    unsigned char row_key[ROW_KEY_LEN];
     char *row_data;
     size_t row_data_len;
     
-    elog(LOG, "rocks_tuple_insert - table_oid=%u", table_oid);
+    PR_LOG("rocks_tuple_insert - table_oid=%u", table_oid);
+    postgresrocks_tuple_insert_calls++;
     
     init_rocksdb();
-    
+
     /* Ensure the slot is properly materialized */
     slot_getallattrs(slot);
+    PR_DEBUG_ONLY(
+        StorageLayout layout = get_effective_table_layout(relation);
+        if (layout != STORAGE_LAYOUT_ROW)
+            PR_LOG("layout hint for relation %s is \"%s\"; using row-store insert path until alternative layouts are implemented",
+                   RelationGetRelationName(relation), storage_layout_name(layout));
+    );
     
     /* Get next row ID (cached for performance) */
     rowid = get_next_row_id(table_oid);
     
     /* Serialize the complete row */
-    row_data = serialize_row(slot, &row_data_len);
+    row_data = serialize_row_reuse(slot, &row_data_len);
     
     /* Create row key */
-    row_key = make_row_key(table_oid, rowid, &row_key_len);
+    fill_row_key(row_key, table_oid, rowid);
     
     /* Initialize global batch if needed */
     if (global_batch == NULL) {
@@ -1111,7 +1449,7 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     }
     
     /* Add to batch instead of immediate write */
-    rocksdb_writebatch_put(global_batch, row_key, row_key_len, row_data, row_data_len);
+    rocksdb_writebatch_put(global_batch, (const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
     batch_size++;
     
     /* Flush batch if it's getting large */
@@ -1119,12 +1457,9 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
         flush_write_batch();
     }
     
-    elog(LOG, "rocks_tuple_insert - added row %lu to batch (size=%d), data_len=%zu", 
-         rowid, batch_size, row_data_len);
+    PR_LOG("rocks_tuple_insert - added row %llu to batch (size=%d), data_len=%zu",
+         (unsigned long long) rowid, batch_size, row_data_len);
     
-    /* Cleanup */
-    pfree(row_key);
-    pfree(row_data);
 }
 
 static void
@@ -1216,7 +1551,8 @@ rocks_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
             free(err);
         }
         
-        elog(LOG, "Speculative insertion succeeded for row %lu", entry->rowid);
+        PR_LOG("Speculative insertion succeeded for row %llu",
+             (unsigned long long) entry->rowid);
     } else {
         /*
          * Speculation failed - we need to "undo" the row ID allocation
@@ -1231,7 +1567,8 @@ rocks_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
             pfree(meta);
         }
         
-        elog(LOG, "Speculative insertion failed for row %lu", entry->rowid);
+        PR_LOG("Speculative insertion failed for row %llu",
+             (unsigned long long) entry->rowid);
     }
     
     /* Clean up the speculative entry */
@@ -1254,7 +1591,9 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
     char *err = NULL;
     int i;
     
-    elog(LOG, "rocks_multi_insert - inserting %d tuples for table_oid=%u", ntuples, table_oid);
+    PR_LOG("rocks_multi_insert - inserting %d tuples for table_oid=%u", ntuples, table_oid);
+    postgresrocks_multi_insert_calls++;
+    postgresrocks_multi_inserted_tuples += ntuples;
     
     init_rocksdb();
     
@@ -1263,8 +1602,7 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
     
     for (i = 0; i < ntuples; i++) {
         uint64 rowid;
-        char *row_key;
-        size_t row_key_len;
+        unsigned char row_key[ROW_KEY_LEN];
         char *row_data;
         size_t row_data_len;
         
@@ -1275,17 +1613,13 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
         rowid = get_next_row_id(table_oid);
         
         /* Serialize the complete row */
-        row_data = serialize_row(slots[i], &row_data_len);
+        row_data = serialize_row_reuse(slots[i], &row_data_len);
         
         /* Create row key */
-        row_key = make_row_key(table_oid, rowid, &row_key_len);
+        fill_row_key(row_key, table_oid, rowid);
         
         /* Add to batch */
-        rocksdb_writebatch_put(batch, row_key, row_key_len, row_data, row_data_len);
-        
-        /* Cleanup per-row allocations */
-        pfree(row_key);
-        pfree(row_data);
+        rocksdb_writebatch_put(batch, (const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
     }
     
     /* Execute the entire batch in one operation */
@@ -1302,7 +1636,7 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
     /* Cleanup */
     rocksdb_writebatch_destroy(batch);
     
-    elog(LOG, "rocks_multi_insert - successfully inserted %d tuples", ntuples);
+    PR_LOG("rocks_multi_insert - successfully inserted %d tuples", ntuples);
 }
 
 static TM_Result
@@ -1313,8 +1647,8 @@ rocks_tuple_delete(Relation relation, ItemPointer tid,
 {
     Oid table_oid = RelationGetRelid(relation);
     uint64 rowid;
-    char *key, *err = NULL;
-    size_t key_len;
+    unsigned char key[ROW_KEY_LEN];
+    char *err = NULL;
     
     init_rocksdb();
     
@@ -1322,19 +1656,17 @@ rocks_tuple_delete(Relation relation, ItemPointer tid,
     rowid = ItemPointerGetBlockNumber(tid) * BLCKSZ + ItemPointerGetOffsetNumber(tid);
     
     /* Create key for this row */
-    key = make_row_key(table_oid, rowid, &key_len);
+    fill_row_key(key, table_oid, rowid);
     
     /* Delete from RocksDB */
-    rocksdb_delete(rocks_db, rocks_write_options, key, key_len, &err);
+    rocksdb_delete(rocks_db, rocks_write_options, (const char *) key, ROW_KEY_LEN, &err);
     
     if (err != NULL) {
         elog(ERROR, "RocksDB delete error: %s", err);
         free(err);
-        pfree(key);
         return TM_Deleted; /* Indicate failure */
     }
     
-    pfree(key);
     return TM_Ok;
 }
 
@@ -1365,7 +1697,7 @@ rocks_finish_bulk_insert(Relation relation, int options)
 {
     Oid table_oid = RelationGetRelid(relation);
     
-    elog(LOG, "rocks_finish_bulk_insert - finalizing bulk insert for table_oid=%u", table_oid);
+    PR_LOG("rocks_finish_bulk_insert - finalizing bulk insert for table_oid=%u", table_oid);
     
     /* First flush any pending write batch */
     flush_write_batch();
@@ -1373,7 +1705,7 @@ rocks_finish_bulk_insert(Relation relation, int options)
     /* Then ensure metadata is flushed */
     flush_row_counter_metadata(table_oid);
     
-    elog(LOG, "rocks_finish_bulk_insert - completed for table_oid=%u", table_oid);
+    PR_LOG("rocks_finish_bulk_insert - completed for table_oid=%u", table_oid);
 }
 
 /* Relation operations */
@@ -1396,6 +1728,7 @@ rocks_relation_set_new_filelocator(Relation rel,
     /* Create table metadata with column types */
     meta = get_table_metadata(table_oid, true);
     meta->column_count = natts;
+    meta->layout = (uint32) parse_storage_layout(postgresrocks_default_layout);
     
     /* Store column types */
     for (i = 0; i < natts && i < MaxAttrNumber; i++) {
@@ -1497,7 +1830,7 @@ static bool
 rocks_scan_analyze_next_block(TableScanDesc scan,
                              ReadStream *stream)
 {
-    elog(LOG, "rocks_scan_analyze_next_block called");
+    PR_LOG("rocks_scan_analyze_next_block called");
     /* TODO: Implement analysis block scanning */
     return false;
 }
@@ -1508,7 +1841,7 @@ rocks_scan_analyze_next_tuple(TableScanDesc scan,
                              double *liverows, double *deadrows,
                              TupleTableSlot *slot)
 {
-    elog(LOG, "rocks_scan_analyze_next_tuple called");
+    PR_LOG("rocks_scan_analyze_next_tuple called");
     /* TODO: Implement analysis tuple scanning */
     return false;
 }
@@ -1524,7 +1857,7 @@ rocks_index_build_range_scan(Relation tablerel, Relation indexrel,
                             void *callback_state,
                             TableScanDesc scan)
 {
-    elog(LOG, "rocks_index_build_range_scan called");
+    PR_LOG("rocks_index_build_range_scan called");
     /* TODO: Implement index building */
     return 0.0;
 }
@@ -1534,7 +1867,7 @@ rocks_index_validate_scan(Relation tablerel, Relation indexrel,
                          IndexInfo *indexInfo, Snapshot snapshot,
                          ValidateIndexState *state)
 {
-    elog(LOG, "rocks_index_validate_scan called");
+    PR_LOG("rocks_index_validate_scan called");
     /* TODO: Implement index validation */
 }
 
@@ -1610,12 +1943,10 @@ rocks_relation_estimate_size(Relation rel, int32 *attr_widths,
                             BlockNumber *pages, double *tuples,
                             double *allvisfrac)
 {
-    elog(LOG, "rocks_relation_estimate_size called");
+    PR_LOG("rocks_relation_estimate_size called");
     
     /* Provide basic estimates for query planning */
     *pages = 1000;           /* Estimate 1000 pages */
     *tuples = 10000.0;       /* Estimate 10000 tuples */
     *allvisfrac = 1.0;       /* All pages are visible */
 }
-
-

@@ -2,8 +2,13 @@
 DROP EXTENSION IF EXISTS postgresrocks CASCADE;
 CREATE EXTENSION postgresrocks;
 
+SET postgresrocks.default_layout = 'hybrid';
+
 -- Create a test table using our RocksDB storage engine
 CREATE TABLE test_table(id INT, name TEXT) USING postgresrocks;
+SELECT postgresrocks_get_table_layout('test_table');
+SELECT postgresrocks_set_table_layout('test_table', 'row');
+SELECT postgresrocks_get_table_layout('test_table');
 
 -- Test basic insertion
 INSERT INTO test_table VALUES (1, 'Hello');

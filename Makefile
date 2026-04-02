@@ -1,6 +1,9 @@
 MODULES = postgresrocks
 EXTENSION = postgresrocks
 DATA = postgresrocks--0.0.1.sql
+PG_CONFIG ?= pg_config-18
+PG_BINDIR := $(shell $(PG_CONFIG) --bindir)
+PG_CTL := $(PG_BINDIR)/pg_ctl
 
 # Detect operating system
 UNAME_S := $(shell uname -s)
@@ -15,12 +18,12 @@ ifeq ($(UNAME_S),Darwin)
     ifneq (,$(wildcard $(ROCKSDB_HOMEBREW)))
         PG_CPPFLAGS += -I$(ROCKSDB_HOMEBREW)/include
         PG_LDFLAGS += -L$(ROCKSDB_HOMEBREW)/lib
-        LIBS += -lrocksdb -lstdc++
+        SHLIB_LINK += -lrocksdb -lstdc++
     else
         # Fallback to standard paths
         PG_CPPFLAGS += -I$(HOMEBREW_PREFIX)/include -I/usr/local/include
         PG_LDFLAGS += -L$(HOMEBREW_PREFIX)/lib -L/usr/local/lib
-        LIBS += -lrocksdb -lstdc++
+        SHLIB_LINK += -lrocksdb -lstdc++
     endif
     
     # macOS-specific flags
@@ -28,19 +31,41 @@ ifeq ($(UNAME_S),Darwin)
     
 else
     # Linux/other Unix systems
-    LIBS += -lrocksdb -lstdc++
+    SHLIB_LINK += -lrocksdb -lstdc++
     PG_CPPFLAGS += -I/usr/local/include
     PG_LDFLAGS += -L/usr/local/lib
 endif
 
-PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 # Custom rule to link with RocksDB properly
 %.dylib: %.o
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(LDFLAGS_SL) $(LDFLAGS) $(CFLAGS) $< -L/opt/homebrew/opt/rocksdb/lib -lrocksdb -lstdc++ $(BE_DLLLIBS) -bundle -bundle_loader $(bindir)/postgres -o $@
+	$(CC) $(LDFLAGS_SL) $(LDFLAGS) $(CFLAGS) $< -L$(HOMEBREW_PREFIX)/lib -lrocksdb -lstdc++ $(BE_DLLLIBS) -bundle -bundle_loader $(bindir)/postgres -o $@
 else
 	$(CC) $(LDFLAGS_SL) $(LDFLAGS) $< -lrocksdb -lstdc++ $(BE_DLLLIBS) -o $@
 endif
+
+.PHONY: restart-postgres install-restart
+
+restart-postgres:
+ifeq ($(UNAME_S),Darwin)
+	@if command -v brew >/dev/null 2>&1; then \
+		brew services restart postgresql@18; \
+	elif [ -n "$$PGDATA" ]; then \
+		"$(PG_CTL)" -D "$$PGDATA" restart; \
+	else \
+		echo "Unable to restart PostgreSQL automatically. Install Homebrew PostgreSQL 18 or set PGDATA."; \
+		exit 1; \
+	fi
+else
+	@if [ -n "$$PGDATA" ]; then \
+		"$(PG_CTL)" -D "$$PGDATA" restart; \
+	else \
+		echo "Set PGDATA so $(PG_CTL) can restart PostgreSQL."; \
+		exit 1; \
+	fi
+endif
+
+install-restart: all install restart-postgres
