@@ -27,3 +27,7 @@ CREATE OR REPLACE FUNCTION postgresrocks_insert_stats(
     OUT multi_inserted_tuples bigint
 ) AS 'postgresrocks', 'postgresrocks_insert_stats'
 LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION postgresrocks_force_flush()
+RETURNS void AS 'postgresrocks', 'postgresrocks_force_flush'
+LANGUAGE C;

@@ -128,6 +128,7 @@ typedef struct RowHeader
 
 static TableMetadata *get_table_metadata(Oid table_oid, bool create_if_missing);
 static void update_table_metadata(Oid table_oid, TableMetadata *meta);
+static void postgresrocks_xact_callback(XactEvent event, void *arg);
 
 void _PG_init(void);
 
@@ -219,6 +220,8 @@ _PG_init(void)
                              NULL,
                              NULL,
                              NULL);
+
+    RegisterXactCallback(postgresrocks_xact_callback, NULL);
 }
 
 /* Helper function to create row data key */
@@ -866,6 +869,67 @@ flush_row_counter_metadata(Oid table_oid)
     }
 }
 
+static void
+reset_dirty_row_counters(void)
+{
+    HASH_SEQ_STATUS status;
+    RowCounterEntry *entry;
+
+    if (row_counters == NULL)
+        return;
+
+    hash_seq_init(&status, row_counters);
+    while ((entry = hash_seq_search(&status)) != NULL) {
+        if (entry->dirty) {
+            TableMetadata *meta = get_table_metadata(entry->table_oid, false);
+
+            if (meta != NULL) {
+                entry->next_rowid = meta->row_count + 1;
+                pfree(meta);
+            } else {
+                entry->next_rowid = 1;
+            }
+            entry->dirty = false;
+        }
+    }
+}
+
+static void
+postgresrocks_xact_callback(XactEvent event, void *arg)
+{
+    switch (event)
+    {
+        case XACT_EVENT_PRE_COMMIT:
+        case XACT_EVENT_PARALLEL_PRE_COMMIT:
+            if (rocks_db != NULL) {
+                HASH_SEQ_STATUS status;
+                RowCounterEntry *entry;
+
+                flush_write_batch();
+
+                if (row_counters != NULL) {
+                    hash_seq_init(&status, row_counters);
+                    while ((entry = hash_seq_search(&status)) != NULL) {
+                        if (entry->dirty)
+                            flush_row_counter_metadata(entry->table_oid);
+                    }
+                }
+            }
+            break;
+
+        case XACT_EVENT_ABORT:
+        case XACT_EVENT_PARALLEL_ABORT:
+            if (global_batch != NULL)
+                rocksdb_writebatch_clear(global_batch);
+            batch_size = 0;
+            reset_dirty_row_counters();
+            break;
+
+        default:
+            break;
+    }
+}
+
 /* Forward declarations */
 static const TupleTableSlotOps *rocks_slot_callbacks(Relation relation);
 static TableScanDesc rocks_beginscan(Relation relation, Snapshot snapshot,
@@ -1267,6 +1331,28 @@ postgresrocks_insert_stats(PG_FUNCTION_ARGS)
     values[2] = Int64GetDatum((int64) postgresrocks_multi_inserted_tuples);
 
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(postgresrocks_force_flush);
+Datum
+postgresrocks_force_flush(PG_FUNCTION_ARGS)
+{
+    HASH_SEQ_STATUS status;
+    RowCounterEntry *entry;
+
+    if (rocks_db != NULL) {
+        flush_write_batch();
+
+        if (row_counters != NULL) {
+            hash_seq_init(&status, row_counters);
+            while ((entry = hash_seq_search(&status)) != NULL) {
+                if (entry->dirty)
+                    flush_row_counter_metadata(entry->table_oid);
+            }
+        }
+    }
+
+    PG_RETURN_VOID();
 }
 
 /* Slot callbacks - use heap tuple table slots for compatibility */
