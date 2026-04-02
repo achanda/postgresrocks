@@ -31,11 +31,22 @@
 #include "access/multixact.h"
 #include "access/attnum.h"
 #include "storage/bufpage.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/shmem.h"
 #include "utils/guc.h"
+#include "postmaster/bgworker.h"
+#include "miscadmin.h"
 
 #include <rocksdb/c.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 PG_MODULE_MAGIC;
 
@@ -59,6 +70,55 @@ static size_t serialize_buffer_capacity = 0;
 static uint64 postgresrocks_tuple_insert_calls = 0;
 static uint64 postgresrocks_multi_insert_calls = 0;
 static uint64 postgresrocks_multi_inserted_tuples = 0;
+static int rocks_lock_fd = -1;
+static bool rocks_lock_held = false;
+typedef enum RocksSessionMode
+{
+    ROCKS_SESSION_NONE = 0,
+    ROCKS_SESSION_READ = 1,
+    ROCKS_SESSION_WRITE = 2
+} RocksSessionMode;
+static RocksSessionMode rocks_session_mode = ROCKS_SESSION_NONE;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+#define POSTGRESROCKS_LWLOCK_TRANCHE "postgresrocks_writer_tranche"
+#define POSTGRESROCKS_BGWORKER_NAME "postgresrocks_writer"
+#define POSTGRESROCKS_MAX_KEY_SIZE 64
+#define POSTGRESROCKS_MAX_VALUE_SIZE 8192
+#define POSTGRESROCKS_ERROR_SIZE 256
+
+typedef enum RocksWriterRequestType
+{
+    ROCKS_WRITER_REQ_NONE = 0,
+    ROCKS_WRITER_REQ_PUT = 1,
+    ROCKS_WRITER_REQ_DELETE = 2
+} RocksWriterRequestType;
+
+typedef enum RocksWriterRequestStatus
+{
+    ROCKS_WRITER_STATUS_IDLE = 0,
+    ROCKS_WRITER_STATUS_PENDING = 1,
+    ROCKS_WRITER_STATUS_DONE = 2,
+    ROCKS_WRITER_STATUS_ERROR = 3
+} RocksWriterRequestStatus;
+
+typedef struct RocksWriterSharedState
+{
+    int writer_procno;
+    int waiter_procno;
+    int request_type;
+    int status;
+    Size key_len;
+    Size value_len;
+    char key[POSTGRESROCKS_MAX_KEY_SIZE];
+    char value[POSTGRESROCKS_MAX_VALUE_SIZE];
+    char error[POSTGRESROCKS_ERROR_SIZE];
+} RocksWriterSharedState;
+
+static RocksWriterSharedState *rocks_writer_state = NULL;
+static LWLock *rocks_writer_lock = NULL;
+static bool postgresrocks_writer_registered = false;
 
 /* Hash table for tracking speculative insertions */
 static HTAB* speculative_insertions = NULL;
@@ -129,6 +189,16 @@ typedef struct RowHeader
 static TableMetadata *get_table_metadata(Oid table_oid, bool create_if_missing);
 static void update_table_metadata(Oid table_oid, TableMetadata *meta);
 static void postgresrocks_xact_callback(XactEvent event, void *arg);
+static void close_rocksdb_session(void);
+static void init_rocksdb(RocksSessionMode requested_mode);
+static void postgresrocks_shmem_request(void);
+static void postgresrocks_shmem_startup(void);
+void postgresrocks_writer_main(Datum main_arg);
+static bool postgresrocks_writer_available(void);
+static void postgresrocks_writer_put(const char *key, size_t key_len,
+                                     const char *value, size_t value_len);
+static void postgresrocks_writer_delete(const char *key, size_t key_len);
+static void clear_row_counter_cache(void);
 
 void _PG_init(void);
 
@@ -199,6 +269,29 @@ configure_write_options(void)
 void
 _PG_init(void)
 {
+    if (process_shared_preload_libraries_in_progress)
+    {
+        BackgroundWorker worker;
+
+        prev_shmem_request_hook = shmem_request_hook;
+        shmem_request_hook = postgresrocks_shmem_request;
+        prev_shmem_startup_hook = shmem_startup_hook;
+        shmem_startup_hook = postgresrocks_shmem_startup;
+
+        MemSet(&worker, 0, sizeof(worker));
+        worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+        worker.bgw_start_time = BgWorkerStart_PostmasterStart;
+        worker.bgw_restart_time = 1;
+        snprintf(worker.bgw_library_name, BGW_MAXLEN, "postgresrocks");
+        snprintf(worker.bgw_function_name, BGW_MAXLEN, "postgresrocks_writer_main");
+        snprintf(worker.bgw_name, BGW_MAXLEN, POSTGRESROCKS_BGWORKER_NAME);
+        snprintf(worker.bgw_type, BGW_MAXLEN, POSTGRESROCKS_BGWORKER_NAME);
+        worker.bgw_notify_pid = 0;
+
+        RegisterBackgroundWorker(&worker);
+        postgresrocks_writer_registered = true;
+    }
+
     DefineCustomStringVariable("postgresrocks.default_layout",
                                "Default storage layout hint for new postgresrocks tables.",
                                "Accepted values are row, hybrid, and column.",
@@ -222,6 +315,38 @@ _PG_init(void)
                              NULL);
 
     RegisterXactCallback(postgresrocks_xact_callback, NULL);
+}
+
+static void
+postgresrocks_shmem_request(void)
+{
+    if (prev_shmem_request_hook)
+        prev_shmem_request_hook();
+
+    RequestAddinShmemSpace(MAXALIGN(sizeof(RocksWriterSharedState)));
+    RequestNamedLWLockTranche(POSTGRESROCKS_LWLOCK_TRANCHE, 1);
+}
+
+static void
+postgresrocks_shmem_startup(void)
+{
+    bool found;
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+
+    rocks_writer_state = ShmemInitStruct("postgresrocks writer state",
+                                         sizeof(RocksWriterSharedState),
+                                         &found);
+    if (!found)
+    {
+        MemSet(rocks_writer_state, 0, sizeof(RocksWriterSharedState));
+        rocks_writer_state->writer_procno = -1;
+        rocks_writer_state->waiter_procno = -1;
+    }
+
+    rocks_writer_lock = &(GetNamedLWLockTranche(POSTGRESROCKS_LWLOCK_TRANCHE))[0].lock;
+    LWLockRelease(AddinShmemInitLock);
 }
 
 /* Helper function to create row data key */
@@ -585,31 +710,279 @@ init_speculative_hash(void)
     
 /* Function to initialize RocksDB */
 static void
-init_rocksdb(void)
+init_rocksdb(RocksSessionMode requested_mode)
 {
     char *err = NULL;
-    
+    int lock_mode;
+
+    if (requested_mode == ROCKS_SESSION_NONE)
+        requested_mode = ROCKS_SESSION_READ;
+
     if (rocks_db != NULL)
-        return; /* Already initialized */
-    
-    rocks_options = rocksdb_options_create();
-    rocksdb_options_set_create_if_missing(rocks_options, 1);
-    rocksdb_options_set_compression(rocks_options, rocksdb_no_compression);
-    
-    rocks_read_options = rocksdb_readoptions_create();
-    rocks_write_options = rocksdb_writeoptions_create();
+    {
+        if (rocks_session_mode >= requested_mode)
+            return;
+
+        /* Upgrade read session to write session by reopening under exclusive lock. */
+        close_rocksdb_session();
+    }
+
+    if (rocks_lock_fd == -1)
+    {
+        rocks_lock_fd = open("postgresrocks_data.pglock", O_RDWR | O_CREAT, 0600);
+        if (rocks_lock_fd < 0)
+            elog(ERROR, "Failed to open postgresrocks coordination lock file: %m");
+    }
+
+    if (!rocks_lock_held)
+    {
+        lock_mode = (requested_mode == ROCKS_SESSION_WRITE) ? LOCK_EX : LOCK_SH;
+        if (flock(rocks_lock_fd, lock_mode) != 0)
+            elog(ERROR, "Failed to acquire postgresrocks coordination lock: %m");
+        rocks_lock_held = true;
+    }
+
+    if (rocks_options == NULL)
+    {
+        rocks_options = rocksdb_options_create();
+        rocksdb_options_set_create_if_missing(rocks_options, 1);
+        rocksdb_options_set_compression(rocks_options, rocksdb_no_compression);
+    }
+
+    if (rocks_read_options == NULL)
+        rocks_read_options = rocksdb_readoptions_create();
+
+    if (rocks_write_options == NULL)
+        rocks_write_options = rocksdb_writeoptions_create();
+
     configure_write_options();
-    
-    /* Open database in PostgreSQL data directory */
-    rocks_db = rocksdb_open(rocks_options, "postgresrocks_data", &err);
-    
+
+    /* Open database while holding the coordination lock for this transaction. */
+    if (requested_mode == ROCKS_SESSION_WRITE)
+    {
+        rocks_db = rocksdb_open(rocks_options, "postgresrocks_data", &err);
+    }
+    else
+    {
+        rocks_db = rocksdb_open_for_read_only(rocks_options, "postgresrocks_data", 0, &err);
+    }
+
     if (err != NULL) {
+        if (rocks_lock_held)
+        {
+            flock(rocks_lock_fd, LOCK_UN);
+            rocks_lock_held = false;
+        }
+        rocks_session_mode = ROCKS_SESSION_NONE;
         elog(ERROR, "Failed to open RocksDB: %s", err);
         free(err);
     }
-    
+
+    rocks_session_mode = requested_mode;
+
     /* Initialize speculative insertions tracking */
     init_speculative_hash();
+}
+
+static void
+close_rocksdb_session(void)
+{
+    if (rocks_db != NULL)
+    {
+        rocksdb_close(rocks_db);
+        rocks_db = NULL;
+    }
+
+    if (rocks_lock_held)
+    {
+        if (flock(rocks_lock_fd, LOCK_UN) != 0)
+            elog(WARNING, "Failed to release postgresrocks coordination lock: %m");
+        rocks_lock_held = false;
+    }
+
+    rocks_session_mode = ROCKS_SESSION_NONE;
+}
+
+static bool
+postgresrocks_writer_available(void)
+{
+    return rocks_writer_state != NULL &&
+           rocks_writer_lock != NULL &&
+           rocks_writer_state->writer_procno >= 0;
+}
+
+static void
+postgresrocks_writer_submit_request(RocksWriterRequestType request_type,
+                                    const char *key, size_t key_len,
+                                    const char *value, size_t value_len)
+{
+    int worker_procno;
+
+    if (!postgresrocks_writer_available())
+        elog(ERROR, "postgresrocks writer is not available; preload the extension via shared_preload_libraries");
+
+    if (key_len > POSTGRESROCKS_MAX_KEY_SIZE || value_len > POSTGRESROCKS_MAX_VALUE_SIZE)
+        elog(ERROR, "postgresrocks writer request is too large");
+
+    for (;;)
+    {
+        LWLockAcquire(rocks_writer_lock, LW_EXCLUSIVE);
+        if (rocks_writer_state->status == ROCKS_WRITER_STATUS_IDLE ||
+            rocks_writer_state->status == ROCKS_WRITER_STATUS_DONE ||
+            rocks_writer_state->status == ROCKS_WRITER_STATUS_ERROR)
+        {
+            rocks_writer_state->request_type = request_type;
+            rocks_writer_state->status = ROCKS_WRITER_STATUS_PENDING;
+            rocks_writer_state->waiter_procno = MyProcNumber;
+            rocks_writer_state->key_len = key_len;
+            rocks_writer_state->value_len = value_len;
+            memcpy(rocks_writer_state->key, key, key_len);
+            if (value_len > 0 && value != NULL)
+                memcpy(rocks_writer_state->value, value, value_len);
+            rocks_writer_state->error[0] = '\0';
+            worker_procno = rocks_writer_state->writer_procno;
+            LWLockRelease(rocks_writer_lock);
+            SetLatch(&ProcGlobal->allProcs[worker_procno].procLatch);
+            break;
+        }
+        LWLockRelease(rocks_writer_lock);
+        (void) WaitLatch(MyLatch,
+                         WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         10L,
+                         0);
+        ResetLatch(MyLatch);
+    }
+
+    for (;;)
+    {
+        LWLockAcquire(rocks_writer_lock, LW_EXCLUSIVE);
+        if (rocks_writer_state->status == ROCKS_WRITER_STATUS_DONE)
+        {
+            rocks_writer_state->status = ROCKS_WRITER_STATUS_IDLE;
+            LWLockRelease(rocks_writer_lock);
+            break;
+        }
+        if (rocks_writer_state->status == ROCKS_WRITER_STATUS_ERROR)
+        {
+            char errbuf[POSTGRESROCKS_ERROR_SIZE];
+
+            strlcpy(errbuf, rocks_writer_state->error, sizeof(errbuf));
+            rocks_writer_state->status = ROCKS_WRITER_STATUS_IDLE;
+            LWLockRelease(rocks_writer_lock);
+            elog(ERROR, "postgresrocks writer request failed: %s", errbuf);
+        }
+        LWLockRelease(rocks_writer_lock);
+        (void) WaitLatch(MyLatch,
+                         WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         10L,
+                         0);
+        ResetLatch(MyLatch);
+    }
+}
+
+static void
+postgresrocks_writer_put(const char *key, size_t key_len,
+                         const char *value, size_t value_len)
+{
+    postgresrocks_writer_submit_request(ROCKS_WRITER_REQ_PUT,
+                                        key, key_len, value, value_len);
+}
+
+static void
+postgresrocks_writer_delete(const char *key, size_t key_len)
+{
+    postgresrocks_writer_submit_request(ROCKS_WRITER_REQ_DELETE,
+                                        key, key_len, NULL, 0);
+}
+
+void
+postgresrocks_writer_main(Datum main_arg)
+{
+    char *err = NULL;
+    rocksdb_t *writer_db;
+    rocksdb_options_t *writer_options;
+    rocksdb_writeoptions_t *writer_write_options;
+
+    BackgroundWorkerUnblockSignals();
+
+    writer_options = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(writer_options, 1);
+    rocksdb_options_set_compression(writer_options, rocksdb_no_compression);
+    writer_write_options = rocksdb_writeoptions_create();
+    rocksdb_writeoptions_set_sync(writer_write_options, 0);
+    rocksdb_writeoptions_disable_WAL(writer_write_options, 0);
+
+    writer_db = rocksdb_open(writer_options, "postgresrocks_data", &err);
+    if (err != NULL)
+        ereport(FATAL, (errmsg("postgresrocks writer failed to open RocksDB: %s", err)));
+
+    LWLockAcquire(rocks_writer_lock, LW_EXCLUSIVE);
+    rocks_writer_state->writer_procno = MyProcNumber;
+    rocks_writer_state->status = ROCKS_WRITER_STATUS_IDLE;
+    rocks_writer_state->waiter_procno = -1;
+    LWLockRelease(rocks_writer_lock);
+
+    for (;;)
+    {
+        int rc;
+        RocksWriterRequestType request_type = ROCKS_WRITER_REQ_NONE;
+        int waiter_procno = -1;
+        Size key_len = 0;
+        Size value_len = 0;
+        char key[POSTGRESROCKS_MAX_KEY_SIZE];
+        char value[POSTGRESROCKS_MAX_VALUE_SIZE];
+        char local_err[POSTGRESROCKS_ERROR_SIZE];
+
+        rc = WaitLatch(MyLatch,
+                       WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                       1000L,
+                       0);
+        ResetLatch(MyLatch);
+
+        if (rc & WL_POSTMASTER_DEATH)
+            proc_exit(1);
+
+        LWLockAcquire(rocks_writer_lock, LW_EXCLUSIVE);
+        if (rocks_writer_state->status == ROCKS_WRITER_STATUS_PENDING)
+        {
+            request_type = (RocksWriterRequestType) rocks_writer_state->request_type;
+            waiter_procno = rocks_writer_state->waiter_procno;
+            key_len = rocks_writer_state->key_len;
+            value_len = rocks_writer_state->value_len;
+            memcpy(key, rocks_writer_state->key, key_len);
+            if (value_len > 0)
+                memcpy(value, rocks_writer_state->value, value_len);
+        }
+        LWLockRelease(rocks_writer_lock);
+
+        if (request_type == ROCKS_WRITER_REQ_NONE)
+            continue;
+
+        local_err[0] = '\0';
+        if (request_type == ROCKS_WRITER_REQ_PUT)
+            rocksdb_put(writer_db, writer_write_options, key, key_len, value, value_len, &err);
+        else if (request_type == ROCKS_WRITER_REQ_DELETE)
+            rocksdb_delete(writer_db, writer_write_options, key, key_len, &err);
+
+        LWLockAcquire(rocks_writer_lock, LW_EXCLUSIVE);
+        if (err != NULL)
+        {
+            strlcpy(local_err, err, sizeof(local_err));
+            rocks_writer_state->status = ROCKS_WRITER_STATUS_ERROR;
+            strlcpy(rocks_writer_state->error, local_err, sizeof(rocks_writer_state->error));
+            free(err);
+            err = NULL;
+        }
+        else
+        {
+            rocks_writer_state->status = ROCKS_WRITER_STATUS_DONE;
+            rocks_writer_state->error[0] = '\0';
+        }
+        LWLockRelease(rocks_writer_lock);
+
+        if (waiter_procno >= 0)
+            SetLatch(&ProcGlobal->allProcs[waiter_procno].procLatch);
+    }
 }
 
 /* Get or create table metadata */
@@ -620,7 +993,7 @@ get_table_metadata(Oid table_oid, bool create_if_missing)
     size_t key_len, value_len;
     TableMetadata *meta = palloc0(sizeof(TableMetadata));
     
-    init_rocksdb();
+    init_rocksdb(ROCKS_SESSION_READ);
     
     if (!rocks_db) {
         elog(ERROR, "RocksDB not initialized");
@@ -644,14 +1017,7 @@ get_table_metadata(Oid table_oid, bool create_if_missing)
         meta->row_count = 0;
         meta->column_count = 0;
         
-        /* Store the metadata */
-        rocksdb_put(rocks_db, rocks_write_options, key, key_len,
-                    (char*)meta, sizeof(TableMetadata), &err);
-        
-        if (err != NULL) {
-            elog(ERROR, "RocksDB put error: %s", err);
-            free(err);
-        }
+        update_table_metadata(table_oid, meta);
     } else {
         /* Return NULL if not found and not creating */
         pfree(meta);
@@ -668,15 +1034,24 @@ update_table_metadata(Oid table_oid, TableMetadata *meta)
 {
     char *key, *err = NULL;
     size_t key_len;
-    
+
     key = make_metadata_key(table_oid, &key_len);
-    
-    rocksdb_put(rocks_db, rocks_write_options, key, key_len,
-                (char*)meta, sizeof(TableMetadata), &err);
-    
-    if (err != NULL) {
-        elog(ERROR, "RocksDB put error: %s", err);
-        free(err);
+
+    if (postgresrocks_writer_available())
+    {
+        postgresrocks_writer_put(key, key_len, (char *) meta, sizeof(TableMetadata));
+    }
+    else
+    {
+        init_rocksdb(ROCKS_SESSION_WRITE);
+
+        rocksdb_put(rocks_db, rocks_write_options, key, key_len,
+                    (char*)meta, sizeof(TableMetadata), &err);
+
+        if (err != NULL) {
+            elog(ERROR, "RocksDB put error: %s", err);
+            free(err);
+        }
     }
     
     pfree(key);
@@ -765,15 +1140,33 @@ get_next_row_id(Oid table_oid)
 
 /* Flush pending write batch */
 static void
+clear_row_counter_cache(void)
+{
+    HASH_SEQ_STATUS status;
+    RowCounterEntry *entry;
+
+    if (row_counters == NULL)
+        return;
+
+    hash_seq_init(&status, row_counters);
+    while ((entry = hash_seq_search(&status)) != NULL)
+        hash_search(row_counters, &entry->table_oid, HASH_REMOVE, NULL);
+}
+
+static void
 flush_write_batch(void)
 {
     char *err = NULL;
-    
+
     if (global_batch == NULL || batch_size == 0) {
         PR_LOG("flush_write_batch called but no batch to flush");
         return;
     }
-    
+
+    if (postgresrocks_writer_available())
+        elog(ERROR, "write batching is not supported when the persistent postgresrocks writer is enabled");
+
+    init_rocksdb(ROCKS_SESSION_WRITE);
     PR_LOG("About to flush write batch with %d operations", batch_size);
     
     /* Execute the accumulated batch */
@@ -914,6 +1307,9 @@ postgresrocks_xact_callback(XactEvent event, void *arg)
                             flush_row_counter_metadata(entry->table_oid);
                     }
                 }
+
+                clear_row_counter_cache();
+                close_rocksdb_session();
             }
             break;
 
@@ -923,6 +1319,14 @@ postgresrocks_xact_callback(XactEvent event, void *arg)
                 rocksdb_writebatch_clear(global_batch);
             batch_size = 0;
             reset_dirty_row_counters();
+            clear_row_counter_cache();
+            close_rocksdb_session();
+            break;
+
+        case XACT_EVENT_COMMIT:
+        case XACT_EVENT_PARALLEL_COMMIT:
+            clear_row_counter_cache();
+            close_rocksdb_session();
             break;
 
         default:
@@ -1153,7 +1557,7 @@ postgresrocks_read_data(PG_FUNCTION_ARGS)
         }
         
         /* Initialize RocksDB */
-        init_rocksdb();
+        init_rocksdb(ROCKS_SESSION_READ);
         
         /* Get table metadata to find row count */
         meta = get_table_metadata(table_oid, false);
@@ -1274,7 +1678,7 @@ postgresrocks_set_table_layout(PG_FUNCTION_ARGS)
     StorageLayout layout = parse_storage_layout(layout_name);
     TableMetadata *meta;
 
-    init_rocksdb();
+    init_rocksdb(ROCKS_SESSION_WRITE);
 
     meta = get_table_metadata(table_oid, true);
     meta->layout = (uint32) layout;
@@ -1292,7 +1696,7 @@ postgresrocks_get_table_layout(PG_FUNCTION_ARGS)
     TableMetadata *meta;
     StorageLayout layout = parse_storage_layout(postgresrocks_default_layout);
 
-    init_rocksdb();
+    init_rocksdb(ROCKS_SESSION_READ);
 
     meta = get_table_metadata(table_oid, false);
     if (meta != NULL)
@@ -1379,7 +1783,7 @@ rocks_beginscan(Relation relation, Snapshot snapshot,
     /* Ensure any pending writes are flushed before scanning */
     ensure_writes_flushed();
     
-    init_rocksdb();
+    init_rocksdb(ROCKS_SESSION_READ);
     
     /* Use our custom scan structure */
     scan = (RocksScanDesc *) palloc0(sizeof(RocksScanDesc));
@@ -1508,8 +1912,6 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     PR_LOG("rocks_tuple_insert - table_oid=%u", table_oid);
     postgresrocks_tuple_insert_calls++;
     
-    init_rocksdb();
-
     /* Ensure the slot is properly materialized */
     slot_getallattrs(slot);
     PR_DEBUG_ONLY(
@@ -1528,19 +1930,28 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     /* Create row key */
     fill_row_key(row_key, table_oid, rowid);
     
-    /* Initialize global batch if needed */
-    if (global_batch == NULL) {
-        global_batch = rocksdb_writebatch_create();
-        batch_size = 0;
+    if (postgresrocks_writer_available())
+    {
+        postgresrocks_writer_put((const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
     }
-    
-    /* Add to batch instead of immediate write */
-    rocksdb_writebatch_put(global_batch, (const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
-    batch_size++;
-    
-    /* Flush batch if it's getting large */
-    if (batch_size >= MAX_BATCH_SIZE) {
-        flush_write_batch();
+    else
+    {
+        init_rocksdb(ROCKS_SESSION_WRITE);
+
+        /* Initialize global batch if needed */
+        if (global_batch == NULL) {
+            global_batch = rocksdb_writebatch_create();
+            batch_size = 0;
+        }
+
+        /* Add to batch instead of immediate write */
+        rocksdb_writebatch_put(global_batch, (const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
+        batch_size++;
+
+        /* Flush batch if it's getting large */
+        if (batch_size >= MAX_BATCH_SIZE) {
+            flush_write_batch();
+        }
     }
     
     PR_LOG("rocks_tuple_insert - added row %llu to batch (size=%d), data_len=%zu",
@@ -1558,8 +1969,6 @@ rocks_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
     uint64 rowid;
     SpeculativeInsertEntry *entry;
     bool found;
-    
-    init_rocksdb();
     
     /* Ensure the slot is properly materialized */
     slot_getallattrs(slot);
@@ -1611,8 +2020,6 @@ rocks_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
     Oid table_oid;
     TableMetadata *meta;
     
-    init_rocksdb();
-    
     /* Find the speculative insertion entry */
     entry = (SpeculativeInsertEntry *) hash_search(speculative_insertions,
                                                   &specToken,
@@ -1628,13 +2035,21 @@ rocks_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
         /* 
          * Speculation succeeded - commit the insertion to RocksDB 
          */
-        rocksdb_put(rocks_db, rocks_write_options, 
-                   entry->key, entry->key_len,
-                   entry->data, entry->data_len, &err);
-        
-        if (err != NULL) {
-            elog(ERROR, "RocksDB put error during speculative completion: %s", err);
-            free(err);
+        if (postgresrocks_writer_available())
+        {
+            postgresrocks_writer_put(entry->key, entry->key_len, entry->data, entry->data_len);
+        }
+        else
+        {
+            init_rocksdb(ROCKS_SESSION_WRITE);
+            rocksdb_put(rocks_db, rocks_write_options,
+                       entry->key, entry->key_len,
+                       entry->data, entry->data_len, &err);
+
+            if (err != NULL) {
+                elog(ERROR, "RocksDB put error during speculative completion: %s", err);
+                free(err);
+            }
         }
         
         PR_LOG("Speculative insertion succeeded for row %llu",
@@ -1681,10 +2096,12 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
     postgresrocks_multi_insert_calls++;
     postgresrocks_multi_inserted_tuples += ntuples;
     
-    init_rocksdb();
-    
-    /* Create a write batch for optimal performance */
-    batch = rocksdb_writebatch_create();
+    if (!postgresrocks_writer_available())
+    {
+        init_rocksdb(ROCKS_SESSION_WRITE);
+        /* Create a write batch for optimal performance */
+        batch = rocksdb_writebatch_create();
+    }
     
     for (i = 0; i < ntuples; i++) {
         uint64 rowid;
@@ -1704,23 +2121,29 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
         /* Create row key */
         fill_row_key(row_key, table_oid, rowid);
         
-        /* Add to batch */
-        rocksdb_writebatch_put(batch, (const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
+        if (postgresrocks_writer_available())
+            postgresrocks_writer_put((const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
+        else
+            rocksdb_writebatch_put(batch, (const char *) row_key, ROW_KEY_LEN, row_data, row_data_len);
     }
     
     /* Execute the entire batch in one operation */
-    rocksdb_write(rocks_db, rocks_write_options, batch, &err);
-    
-    if (err != NULL) {
-        elog(ERROR, "RocksDB batch write error: %s", err);
-        free(err);
+    if (!postgresrocks_writer_available())
+    {
+        rocksdb_write(rocks_db, rocks_write_options, batch, &err);
+
+        if (err != NULL) {
+            elog(ERROR, "RocksDB batch write error: %s", err);
+            free(err);
+        }
     }
     
     /* Flush metadata once at the end */
     flush_row_counter_metadata(table_oid);
     
     /* Cleanup */
-    rocksdb_writebatch_destroy(batch);
+    if (batch != NULL)
+        rocksdb_writebatch_destroy(batch);
     
     PR_LOG("rocks_multi_insert - successfully inserted %d tuples", ntuples);
 }
@@ -1736,21 +2159,27 @@ rocks_tuple_delete(Relation relation, ItemPointer tid,
     unsigned char key[ROW_KEY_LEN];
     char *err = NULL;
     
-    init_rocksdb();
-    
     /* Extract row ID from ItemPointer */
     rowid = ItemPointerGetBlockNumber(tid) * BLCKSZ + ItemPointerGetOffsetNumber(tid);
     
     /* Create key for this row */
     fill_row_key(key, table_oid, rowid);
     
-    /* Delete from RocksDB */
-    rocksdb_delete(rocks_db, rocks_write_options, (const char *) key, ROW_KEY_LEN, &err);
-    
-    if (err != NULL) {
-        elog(ERROR, "RocksDB delete error: %s", err);
-        free(err);
-        return TM_Deleted; /* Indicate failure */
+    if (postgresrocks_writer_available())
+    {
+        postgresrocks_writer_delete((const char *) key, ROW_KEY_LEN);
+    }
+    else
+    {
+        init_rocksdb(ROCKS_SESSION_WRITE);
+        /* Delete from RocksDB */
+        rocksdb_delete(rocks_db, rocks_write_options, (const char *) key, ROW_KEY_LEN, &err);
+
+        if (err != NULL) {
+            elog(ERROR, "RocksDB delete error: %s", err);
+            free(err);
+            return TM_Deleted; /* Indicate failure */
+        }
     }
     
     return TM_Ok;
@@ -1809,7 +2238,7 @@ rocks_relation_set_new_filelocator(Relation rel,
     int i;
     
     /* Initialize RocksDB for new table */
-    init_rocksdb();
+    init_rocksdb(ROCKS_SESSION_WRITE);
     
     /* Create table metadata with column types */
     meta = get_table_metadata(table_oid, true);
@@ -1840,7 +2269,7 @@ rocks_relation_nontransactional_truncate(Relation rel)
     size_t prefix_len;
     rocksdb_iterator_t *iter;
     
-    init_rocksdb();
+    init_rocksdb(ROCKS_SESSION_READ);
     
     /* Create prefix for this table's data */
     prefix = make_row_prefix(table_oid, &prefix_len);
@@ -1862,12 +2291,19 @@ rocks_relation_nontransactional_truncate(Relation rel)
             break;
         }
         
-        /* Delete this key */
-        rocksdb_delete(rocks_db, rocks_write_options, key, key_len, &err);
-        if (err != NULL) {
-            elog(WARNING, "Failed to delete key during truncate: %s", err);
-            free(err);
-            err = NULL;
+        if (postgresrocks_writer_available())
+        {
+            postgresrocks_writer_delete(key, key_len);
+        }
+        else
+        {
+            init_rocksdb(ROCKS_SESSION_WRITE);
+            rocksdb_delete(rocks_db, rocks_write_options, key, key_len, &err);
+            if (err != NULL) {
+                elog(WARNING, "Failed to delete key during truncate: %s", err);
+                free(err);
+                err = NULL;
+            }
         }
         
         rocksdb_iter_next(iter);
@@ -1972,7 +2408,7 @@ rocks_relation_size(Relation rel, ForkNumber forkNumber)
         return 0;
     }
     
-    init_rocksdb();
+    init_rocksdb(ROCKS_SESSION_READ);
     
     /* Create prefix for this table's data */
     prefix = make_row_prefix(table_oid, &prefix_len);

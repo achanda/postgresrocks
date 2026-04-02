@@ -4,7 +4,37 @@ A PostgreSQL extension that implements a custom table access method using RocksD
 
 ## Storage Format
 
-The extension uses a row-based storage format where complete rows are stored:
+The extension currently uses a RocksDB-backed row store where each PostgreSQL row is serialized as one RocksDB value.
+
+### RocksDB Key Layout
+
+- **Row data**: `[tag=1][table_oid_be][rowid_be]` -> complete serialized row
+- **Metadata**: `meta_<oid>_info` -> table metadata
+
+The row key is fixed-width binary:
+
+- `1 byte` row tag
+- `4 bytes` table OID in big-endian order
+- `8 bytes` row ID in big-endian order
+
+This gives:
+
+- stable key size
+- ordered row keys per table
+- efficient prefix iteration for table scans
+
+### Table Metadata
+
+Each table stores one metadata record:
+
+- `row_count`
+- `column_count`
+- `layout` hint (`row`, `hybrid`, or `column`)
+- column type OIDs
+
+### Row Storage
+
+Complete rows are stored together:
 
 ```
 Row-Based Storage:
@@ -15,18 +45,27 @@ Row-Based Storage:
 └─────────────────────────┘
 ```
 
-### Key Structure
+### Serialized Row Format
 
-- **Row Data**: `row_<table_oid>_<row_id>` → [complete_serialized_row]
-- **Metadata**: `meta_<table_oid>_info` → [row_count, column_count, column_types]
+Each value is a binary blob with:
+
+- **Row header**: number of attributes and total row length
+- **Null bitmap**: one boolean per attribute
+- **Attribute payloads**: encoded in column order
+
+Supported payload encodings today:
+
+- `INT4`: 4-byte integer
+- `INT8`: 8-byte integer
+- `TEXT` / `VARCHAR`: 4-byte length followed by raw bytes
 
 ### Data Organization
 
-1. **Complete Row Storage**: Each row is stored as a single, self-contained unit
-2. **Binary Serialization**: Efficient binary format with row header and typed data
-3. **Null Bitmap**: Compact null value representation
-4. **Type-Aware Format**: Optimized serialization for INT4, INT8, TEXT, and VARCHAR
-5. **Simple Key Schema**: Direct row lookup without complex mapping
+1. **Complete row storage**: each row is stored as one self-contained RocksDB value
+2. **Binary serialization**: rows are encoded in a compact typed binary format
+3. **Ordered keys**: row keys are sortable and grouped by table
+4. **Prefix scans**: table scans can iterate over one table’s row-key prefix
+5. **Simple metadata record**: table-level information is stored separately from row data
 
 ### Row Format
 
@@ -124,6 +163,13 @@ The extension now accepts a user-provided layout hint for each table:
 - `column`: intended for scan-heavy analytics
 
 Today, PostgresRocks persists and exposes the hint, but still executes through the row-store code path while hybrid/column storage is being built out.
+
+### Current Limitations
+
+- Reads and scans still use a row-oriented execution model
+- There is no true columnar or hybrid execution path yet
+- Multi-backend coordination around RocksDB access is still limited
+- Read/query performance is not yet as integrated with PostgreSQL as the native heap AM
 
 ## Testing
 

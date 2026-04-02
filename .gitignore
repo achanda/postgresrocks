@@ -59,3 +59,18 @@ valgrind-*.log
 # PostgreSQL specific
 postgresql.conf.local
 pg_hba.conf.local
+
+# Paper / LaTeX build artifacts
+paper.pdf
+paper.aux
+paper.bbl
+paper.bcf
+paper.blg
+paper.fdb_latexmk
+paper.fls
+paper.log
+paper.out
+paper.run.xml
+paper.toc
+paper.synctex.gz
+paper.tex

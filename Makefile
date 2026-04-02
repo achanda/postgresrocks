@@ -47,7 +47,7 @@ else
 	$(CC) $(LDFLAGS_SL) $(LDFLAGS) $< -lrocksdb -lstdc++ $(BE_DLLLIBS) -o $@
 endif
 
-.PHONY: restart-postgres install-restart
+.PHONY: restart-postgres install-restart paper clean-paper
 
 restart-postgres:
 ifeq ($(UNAME_S),Darwin)
@@ -69,3 +69,21 @@ else
 endif
 
 install-restart: all install restart-postgres
+
+paper:
+	@if ! command -v latexmk >/dev/null 2>&1; then \
+		echo "latexmk is not installed. Install MacTeX or a TeX Live setup with latexmk and acmart."; \
+		exit 1; \
+	fi
+	@kpsewhich acmart.cls >/dev/null 2>&1 || { \
+		echo "acmart.cls not found. Install the ACM LaTeX class (usually included with MacTeX/TeX Live)."; \
+		exit 1; \
+	}
+	latexmk -pdf paper.tex
+
+clean-paper:
+	@if command -v latexmk >/dev/null 2>&1; then \
+		latexmk -C paper.tex; \
+	else \
+		rm -f paper.pdf paper.aux paper.bbl paper.blg paper.fdb_latexmk paper.fls paper.log paper.out paper.toc; \
+	fi
