@@ -1,4 +1,5 @@
-MODULES = postgresrocks
+MODULE_big = postgresrocks
+OBJS = postgresrocks.o postgresrocks_codec.o
 EXTENSION = postgresrocks
 DATA = postgresrocks--0.0.1.sql
 PG_CONFIG ?= pg_config-18
@@ -38,14 +39,6 @@ endif
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
-
-# Custom rule to link with RocksDB properly
-%.dylib: %.o
-ifeq ($(UNAME_S),Darwin)
-	$(CC) $(LDFLAGS_SL) $(LDFLAGS) $(CFLAGS) $< -L$(HOMEBREW_PREFIX)/lib -lrocksdb -lstdc++ $(BE_DLLLIBS) -bundle -bundle_loader $(bindir)/postgres -o $@
-else
-	$(CC) $(LDFLAGS_SL) $(LDFLAGS) $< -lrocksdb -lstdc++ $(BE_DLLLIBS) -o $@
-endif
 
 .PHONY: restart-postgres install-restart paper clean-paper
 

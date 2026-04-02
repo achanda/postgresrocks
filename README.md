@@ -50,7 +50,7 @@ Row-Based Storage:
 Each value is a binary blob with:
 
 - **Row header**: number of attributes and total row length
-- **Null bitmap**: one boolean per attribute
+- **Null bitmap**: one bit per attribute
 - **Attribute payloads**: encoded in column order
 
 Supported payload encodings today:
@@ -76,6 +76,10 @@ Each serialized row contains:
 │ (metadata)  │ (per attr)  │ (typed values)  │
 └─────────────┴─────────────┴─────────────────┘
 ```
+
+The serializer uses a packed null bitmap and packed-varlena access helpers for
+`TEXT`/`VARCHAR`, which keeps the binary row layout tighter and reduces some
+copying overhead on inserts.
 
 ## Prerequisites
 
