@@ -3679,6 +3679,7 @@ rocks_tuple_insert(Relation relation, TupleTableSlot *slot,
     
     /* Create row key */
     fill_row_key(row_key, table_oid, rocks_relation_storage_id(relation), rowid);
+    rowid_to_tid(rowid, &slot->tts_tid);
 
     if (use_shared_writer)
     {
@@ -3876,6 +3877,7 @@ rocks_multi_insert(Relation relation, TupleTableSlot **slots,
         
         /* Create row key */
         fill_row_key(row_key, table_oid, rocks_relation_storage_id(relation), rowid);
+        rowid_to_tid(rowid, &slots[i]->tts_tid);
 
         {
             TimestampTz batch_put_start = GetCurrentTimestamp();

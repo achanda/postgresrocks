@@ -95,12 +95,9 @@ ensure_serialize_attr_capacity(int natts)
 static void
 prepare_text_datum(Datum value, struct varlena **text_ptr, const char **data_ptr, int32 *len)
 {
-    struct varlena *txt = (struct varlena *) DatumGetPointer(value);
+    text *txt = (text *) PG_DETOAST_DATUM_COPY(value);
 
-    if (VARATT_IS_EXTERNAL(txt) || VARATT_IS_COMPRESSED(txt))
-        txt = PG_DETOAST_DATUM_PACKED(value);
-
-    *text_ptr = txt;
+    *text_ptr = (struct varlena *) txt;
     *len = VARSIZE_ANY_EXHDR(txt);
     *data_ptr = VARDATA_ANY(txt);
 }
@@ -138,7 +135,8 @@ codec_measure_text(AttrCodec *codec, Datum value, bool isnull,
     if (isnull)
         return 0;
 
-    prepare_text_datum(value, text_ptr, text_data, text_len);
+    if (*text_ptr == NULL)
+        prepare_text_datum(value, text_ptr, text_data, text_len);
     return sizeof(int32) + *text_len;
 }
 
@@ -179,7 +177,8 @@ codec_encode_text(AttrCodec *codec, char **dst, Datum value,
     *dst += sizeof(int32);
     memcpy(*dst, text_data, text_len);
     *dst += text_len;
-    if (PointerGetDatum(text_ptr) != value)
+    (void) value;
+    if (text_ptr != NULL)
         pfree(text_ptr);
 }
 
@@ -289,11 +288,11 @@ get_row_encoding_cache(Relation relation)
                                                   HASH_ENTER,
                                                   &found);
 
+    if (!found)
+        MemSet(entry, 0, sizeof(*entry));
+
     if (!found || entry->natts != tupdesc->natts || entry->codecs == NULL)
     {
-        if (entry->codecs != NULL)
-            pfree(entry->codecs);
-
         entry->table_oid = relation->rd_id;
         entry->natts = tupdesc->natts;
         entry->nullmap_size = NULL_BITMAP_SIZE(entry->natts);
@@ -389,16 +388,26 @@ prepare_row_for_serialization(TupleTableSlot *slot, RowEncodingCacheEntry *cache
     size_t total_size = cache->base_row_size;
     int i;
 
+    /*
+     * Materialize the whole attribute array before walking it.
+     */
+    slot_getallattrs(slot);
+
     for (i = 0; i < cache->natts; i++)
     {
         AttrCodec *codec = &cache->codecs[i];
 
-        scratch->values[i] = slot_getattr(slot, i + 1, &scratch->isnulls[i]);
+        scratch->values[i] = slot->tts_values[i];
+        scratch->isnulls[i] = slot->tts_isnull[i];
         scratch->texts[i] = NULL;
         scratch->text_data[i] = NULL;
         scratch->text_lens[i] = 0;
-        slot->tts_values[i] = scratch->values[i];
-        slot->tts_isnull[i] = scratch->isnulls[i];
+
+        if (!scratch->isnulls[i] && codec->kind == ATTR_CODEC_TEXT)
+            prepare_text_datum(scratch->values[i],
+                               &scratch->texts[i],
+                               &scratch->text_data[i],
+                               &scratch->text_lens[i]);
 
         total_size += codec->measure(codec,
                                      scratch->values[i],

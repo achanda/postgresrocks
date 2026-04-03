@@ -67,7 +67,6 @@ FROM generate_series(1, $ROWS) AS g"
             $((ROWS + 1)), 'rolled-back', 1, 17, 'tag', 'note', 1, 'city',
             'region', 2, 'comment', md5('rollback-wide') || md5('payload-wide'), 99, 3, '12345', 'code'
         );"
-        ROLLBACK_CHECK_ENABLED="0"
         ;;
     *)
         echo "Unsupported SCHEMA_PROFILE: $SCHEMA_PROFILE" >&2
@@ -82,22 +81,25 @@ echo "rows: $ROWS"
 echo "schema profile: $SCHEMA_PROFILE"
 echo "point queries: $POINT_QUERIES"
 
-"$PSQL" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "
+setup_sql_file="$(mktemp)"
+cat > "$setup_sql_file" <<SQL
 LOAD 'postgresrocks';
 SET postgresrocks.enable_shared_writer = off;
 CREATE TABLE $TABLE_NAME $SCHEMA_SQL USING postgresrocks;
 INSERT INTO $TABLE_NAME
 $INSERT_SELECT_SQL;
-CREATE INDEX ${TABLE_NAME}_id_idx ON $TABLE_NAME(id);
-ANALYZE $TABLE_NAME;
-SELECT postgresrocks_force_flush();
 $(if [ "$ROLLBACK_CHECK_ENABLED" = "1" ]; then cat <<EOS
 BEGIN;
 $ROLLBACK_INSERT_SQL
 ROLLBACK;
 EOS
 fi)
-" >/dev/null
+CREATE INDEX ${TABLE_NAME}_id_idx ON $TABLE_NAME(id);
+ANALYZE $TABLE_NAME;
+SELECT postgresrocks_force_flush();
+SQL
+"$PSQL" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$setup_sql_file" >/dev/null
+rm -f "$setup_sql_file"
 
 seq_count="$("$PSQL" -d "$DB_NAME" -At -v ON_ERROR_STOP=1 -c "
 SET enable_indexscan=off;
@@ -131,11 +133,7 @@ echo "seq read count: $seq_count"
 echo "indexed point count: $point_count"
 echo "metadata row count: $helper_count"
 echo "direct helper lookup count: $helper_lookup_count"
-if [ "$ROLLBACK_CHECK_ENABLED" = "1" ]; then
-    echo "rolled-back row visible count: $rollback_count"
-else
-    echo "rolled-back row visible count: skipped (known wide-schema blocker)"
-fi
+echo "rolled-back row visible count: $rollback_count"
 
 if [ "$seq_count" != "$ROWS" ]; then
     echo "FAIL: expected seq read count $ROWS, got $seq_count" >&2
@@ -157,7 +155,7 @@ if [ "$helper_count" != "$ROWS" ]; then
     exit 1
 fi
 
-if [ "$ROLLBACK_CHECK_ENABLED" = "1" ] && [ "$rollback_count" != "0" ]; then
+if [ "$rollback_count" != "0" ]; then
     echo "FAIL: expected rollback visibility count 0, got $rollback_count" >&2
     exit 1
 fi
